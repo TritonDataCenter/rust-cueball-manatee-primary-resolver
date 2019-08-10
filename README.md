@@ -1,5 +1,7 @@
 # cueball-manatee-primary-resolver
 
+This is a work in progress!
+
 ## About
 
 This is an implementation of the[cueball](https://github.com/joyent/rust-cueball) `Resolver` trait that provides
