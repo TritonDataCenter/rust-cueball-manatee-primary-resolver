@@ -2,7 +2,9 @@
  * Copyright 2019 Joyent, Inc.
  */
 
-use std::net::{SocketAddr};
+use std::convert::From;
+use std::fmt::Debug;
+use std::net::{AddrParseError, SocketAddr};
 use std::str::{FromStr};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -12,6 +14,8 @@ use std::time::Duration;
 use itertools::Itertools;
 use serde_json;
 use serde_json::Value;
+use serde_json::error::Error as SerdeJsonError;
+use url::{Url, ParseError};
 use zookeeper::{
     Watcher,
     WatchedEvent,
@@ -19,6 +23,10 @@ use zookeeper::{
     ZooKeeper,
     Stat,
 };
+
+// TODO remove once done debugging
+use std::net::TcpStream;
+
 
 use cueball::backend::*;
 use cueball::resolver::{
@@ -28,6 +36,9 @@ use cueball::resolver::{
     Resolver
 };
 
+// TODO make sure set_error is being called everywhere there's a client-facing
+// error
+
 // An error type to be used internally.
 // The "should_stop" field indicates whether the Resolver should stop() in
 // response to the error -- if false, it will instead continue watching for
@@ -36,6 +47,33 @@ use cueball::resolver::{
 pub struct ResolverError {
     message: String,
     should_stop: bool
+}
+
+impl From<ParseError> for ResolverError {
+    fn from(e: ParseError) -> Self {
+        ResolverError {
+            message: format!("{:?}", e),
+            should_stop: false
+        }
+    }
+}
+
+impl From<SerdeJsonError> for ResolverError {
+    fn from(e: SerdeJsonError) -> Self {
+        ResolverError {
+            message: format!("{:?}", e),
+            should_stop: false
+        }
+    }
+}
+
+impl From<AddrParseError> for ResolverError {
+    fn from(e: AddrParseError) -> Self {
+        ResolverError {
+            message: format!("{:?}", e),
+            should_stop: false
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -56,7 +94,7 @@ enum MachineState {
 #[derive(Debug)]
 enum MachineEvent {
     Connect,
-    Disconnect,
+    ConnectError,
     Stop,
     ArmWatch,
     ReceiveEvent,
@@ -82,7 +120,9 @@ impl StateMachine {
         let next = match (&self.state, event) {
             (MachineState::NoSession, MachineEvent::Connect) =>
                 MachineState::HandlingEvent,
-            (MachineState::HandlingEvent, MachineEvent::Disconnect) =>
+            (MachineState::NoSession, MachineEvent::ConnectError) =>
+                MachineState::NoSession,
+            (MachineState::HandlingEvent, MachineEvent::ConnectError) =>
                 MachineState::NoSession,
             (MachineState::HandlingEvent, MachineEvent::Stop) =>
                 MachineState::Stopping,
@@ -90,7 +130,7 @@ impl StateMachine {
                 MachineState::WaitingForEvent,
             (MachineState::WaitingForEvent, MachineEvent::ReceiveEvent) =>
                 MachineState::HandlingEvent,
-            (MachineState::WaitingForEvent, MachineEvent::Disconnect) =>
+            (MachineState::WaitingForEvent, MachineEvent::ConnectError) =>
                 MachineState::NoSession,
             (s, e) =>
                 panic!(
@@ -226,7 +266,8 @@ impl ManateePrimaryResolver {
         pool_tx: Sender<BackendMsg>,
         event_tx: Sender<ResolverEvent>,
         event_rx: Arc<Mutex<Receiver<ResolverEvent>>>,
-        last_backend: Arc<Mutex<Option<BackendKey>>>
+        last_backend: Arc<Mutex<Option<BackendKey>>>,
+        error_arcmut: Arc<Mutex<Option<String>>>
     ) {
         let event_rx = event_rx.lock().unwrap();
         let mut machine = StateMachine::new();
@@ -246,17 +287,34 @@ impl ManateePrimaryResolver {
                 // NoSession: Connect to zookeeper
                 MachineState::NoSession => {
                     let cs = connect_string.to_string();
-                    zk = Some(ZooKeeper::connect(
+                    println!("Attempting to connect");
+                    let machine_event = match ZooKeeper::connect(
                         &cs,
                         Duration::from_secs(30),
                         SessionEventWatcher{
                             event_tx: event_tx.clone()
-                        }).unwrap());
-                    machine.set_next_state(MachineEvent::Connect)
+                        }) {
+                        Ok(zookeeper) => {
+                            // TODO whyyyy does this case get hit even when zk is disabled???
+                            println!("Attempt successful!");
+                            zk = Some(zookeeper);
+                            MachineEvent::Connect
+                        },
+                        Err(e) => {
+                            println!("Attempt failed!");
+                            zk = None;
+                            ManateePrimaryResolver::set_error(
+                                Arc::clone(&error_arcmut),
+                                &e
+                            );
+                            MachineEvent::ConnectError
+                        }
+                    };
+                    machine.set_next_state(machine_event)
                 }
 
-                // HandlingEvent: We are connected to zookeeper but haven't set a
-                // watch yet. If we're here, it means that we've received an
+                // HandlingEvent: We are connected to zookeeper but haven't set
+                // a watch yet. If we're here, it means that we've received an
                 // event on the channel (except for the first iteration, which
                 // is why we set curr_event artificially). Thus, we process
                 // the event and get ready to receive another event. If the
@@ -265,52 +323,72 @@ impl ManateePrimaryResolver {
                 // not come from watches, so we can just transition to the next
                 // state.
                 MachineState::HandlingEvent => {
+                    let ten_millis = Duration::from_millis(1000);
+                    thread::sleep(ten_millis);
+
+                    // The zk client must exist at this point
                     // TODO account for case where cluster_state_path doesn't
                     // exist in zk yet -- maybe poll every 30 seconds?
-                    let machine_event = match &zk {
-                        Some(zk) => {
+                    let machine_event;
+                    let zk = zk.as_ref().unwrap();
+                    match curr_event {
+                        // The cluster topology has changed -- we thus
+                        // get the new primary and call process_value.
+                        ResolverEvent::DataChangedEvent => {
+                            machine_event = || -> MachineEvent {
+                                let curr_value;
+                                match zk.get_data_w(
+                                    &cluster_state_path,
+                                    ClusterStateWatcher{
+                                        event_tx: event_tx.clone()
+                                    }) {
 
-                            // TODO assert instead
-                            match curr_event {
-                                // The cluster topology has changed -- we thus
-                                // get the new primary and call process_value.
-                                ResolverEvent::DataChangedEvent => {
-                                    let curr_value = zk.get_data_w(
-                                        &cluster_state_path,
-                                        ClusterStateWatcher{
-                                            event_tx: event_tx.clone()
-                                        }).unwrap();
-                                    let pool_tx_clone = pool_tx.clone();
-                                    let backend_clone =
-                                        Arc::clone(&last_backend);
-                                    match ManateePrimaryResolver::process_value(
-                                        &pool_tx_clone,
-                                        &curr_value,
-                                        backend_clone) {
-                                        Ok(_) => MachineEvent::ArmWatch,
-                                        Err(rerr) => if rerr.should_stop {
-                                            MachineEvent::Stop
-                                        } else {
-                                            MachineEvent::ArmWatch
-                                        }
-
+                                    Ok(data) => {
+                                        curr_value = data;
+                                    },
+                                    Err(e) => {
+                                        ManateePrimaryResolver::set_error(
+                                            Arc::clone(&error_arcmut),
+                                            &e
+                                        );
+                                        // TODO handle error more specifically
+                                        return MachineEvent::ConnectError;
                                     }
-                                },
-                                // The state of our session has changed.
-                                ResolverEvent::SessionEvent => {
-                                    println!("oooy!");
-                                    MachineEvent::ArmWatch
-                                },
-                                // stop() has been called.
-                                ResolverEvent::StopEvent => {
-                                    MachineEvent::Stop
                                 }
-                            }
+                                let pool_tx_clone = pool_tx.clone();
+                                let backend_clone =
+                                    Arc::clone(&last_backend);
+                                match ManateePrimaryResolver::process_value(
+                                    &pool_tx_clone,
+                                    &curr_value,
+                                    backend_clone) {
+                                    Ok(_) => {
+                                        return MachineEvent::ArmWatch;
+                                    },
+                                    Err(e) => {
+                                        ManateePrimaryResolver::set_error(
+                                            Arc::clone(&error_arcmut),
+                                            &e
+                                        );
+                                        if e.should_stop {
+                                            return MachineEvent::Stop;
+                                        } else {
+                                            return MachineEvent::ArmWatch;
+                                        }
+                                    }
+                                }
+                            }();
                         },
-                        None =>
-                            panic!("zk client should exist if we're in the \
-                                HandlingEvent state")
-                    };
+                        // The state of our session has changed.
+                        ResolverEvent::SessionEvent => {
+                            println!("oooy!");
+                            machine_event = MachineEvent::ArmWatch;
+                        },
+                        // stop() has been called.
+                        ResolverEvent::StopEvent => {
+                            machine_event = MachineEvent::Stop;
+                        }
+                    }
                     machine.set_next_state(machine_event);
                 },
 
@@ -341,8 +419,6 @@ impl ManateePrimaryResolver {
         }
     }
 
-    // TODO what if there is no primary? Is this a thing that can happen?
-
     /// Parses the given zookeeper node data into a Backend object, compares it
     /// to the last Backend sent to the cueball connection pool, and sends it
     /// to the connection pool if the values differ.
@@ -357,12 +433,12 @@ impl ManateePrimaryResolver {
         new_value: &(Vec<u8>, Stat),
         last_backend: Arc<Mutex<Option<BackendKey>>>
     ) -> Result<(), ResolverError> {
-        let v: Value = serde_json::from_slice(&new_value.0).unwrap();
+        let v: Value = serde_json::from_slice(&new_value.0)?;
 
         // Parse out the ip. We expect the json fields to exist, and return an
         // error if they don't.
         let ip = match &v["primary"]["ip"] {
-            Value::String(s) => BackendAddress::from_str(s).unwrap(),
+            Value::String(s) => BackendAddress::from_str(s)?,
             _ => {
                 return Err(ResolverError {
                     message: "Malformed zookeeper primary data received for \
@@ -372,31 +448,25 @@ impl ManateePrimaryResolver {
             }
         };
 
-        // Parse out the port.
-        //
-        // The "pgUrl" json field is expected to be a string that looks
-        // something like "tcp://postgres@10.77.77.94:5432/postgres". We'd like
-        // to get the port (e.g. 5432) from this string. To do this, we split on
-        // ":", retrieve the third element of the resulting vector (e.g.
-        // "5432/postgres"), then split again on "/" and retrieve the first
-        // element of the resulting vector (e.g. "5432");
-        //
-        // This is admittedly a little janky.
+        // Parse out the port. We expect the json fields to exist, and return an
+        // error if they don't.
         let port = match &v["primary"]["pgUrl"] {
             Value::String(s) => {
-                s.split(":")
-                    .collect::<Vec<&str>>()
-                    .get(2).unwrap()
-                    .split("/")
-                    .collect::<Vec<&str>>()
-                    .get(0).unwrap()
-                    .clone()
-                    .parse::<BackendPort>().unwrap()
+                match Url::parse(s)?.port() {
+                    Some(port) => port,
+                    None => {
+                        return Err(ResolverError {
+                            message: "primary's postgres URL contains no port"
+                                .to_string(),
+                            should_stop: false
+                        })
+                    }
+                }
             },
             _ => {
                 return Err(ResolverError {
                     message: "Malformed zookeeper primary data received for \
-                        \"ip\" field".to_string(),
+                        \"pgUrl\" field".to_string(),
                     should_stop: false
                 })
             }
@@ -440,6 +510,14 @@ impl ManateePrimaryResolver {
         }
         Ok(())
     }
+
+    fn set_error<T: Debug>(
+        error_arcmut: Arc<Mutex<Option<String>>>,
+        new_err: &T) {
+        let mut error = error_arcmut.lock().unwrap();
+        println!("Setting error to: {:?}", new_err);
+        *error = Some(format!("{:?}", new_err));
+    }
 }
 
 impl Resolver for ManateePrimaryResolver {
@@ -456,6 +534,7 @@ impl Resolver for ManateePrimaryResolver {
         let tx_clone = self.event_tx.clone();
         let rx_clone = Arc::clone(&self.event_rx);
         let backend_clone = Arc::clone(&self.last_backend);
+        let error_clone = Arc::clone(&self.error);
 
         // Spawn the background thread that watches for changes
         thread::spawn(move || {
@@ -465,7 +544,8 @@ impl Resolver for ManateePrimaryResolver {
                 s_clone,
                 tx_clone,
                 rx_clone,
-                backend_clone)
+                backend_clone,
+                error_clone)
         });
 
         self.pool_tx = Some(s);
@@ -507,6 +587,8 @@ impl Watcher for SessionEventWatcher {
         // so we assert this fact
         match e.event_type {
             WatchedEventType::None =>
+                // This is an internal channel that we manage, so we expect
+                // sending to succeed
                 self.event_tx.send(ResolverEvent::SessionEvent).unwrap(),
             _ => panic!("Unexpected event type: {:?}", e.event_type)
         };
@@ -524,6 +606,8 @@ impl Watcher for ClusterStateWatcher {
         // WatchedEventType::NodeDataChanged
         match e.event_type {
             WatchedEventType::NodeDataChanged =>
+                // This is an internal channel that we manage, so we expect
+                // sending to succeed
                 self.event_tx.send(ResolverEvent::DataChangedEvent).unwrap(),
             _ => panic!("Unexpected event type: {:?}", e.event_type)
         };
@@ -566,6 +650,13 @@ mod test {
 
     #[test]
     fn sand_test() {
+
+        // loop {
+        //     println!("{:?}", TcpStream::connect("10.77.77.92:2181"));
+        //     let ten_millis = Duration::from_millis(1000);
+        //     thread::sleep(ten_millis);
+        // }
+
         let conn_str = ZKConnectString::from_str(
             "10.77.77.92:2181").unwrap();
         let path = "/manatee/1.moray.virtual.example.com".to_string();
