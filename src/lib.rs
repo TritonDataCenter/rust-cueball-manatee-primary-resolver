@@ -5,6 +5,7 @@
 use std::convert::From;
 use std::fmt::Debug;
 use std::net::{AddrParseError, SocketAddr};
+use std::rc::Rc;
 use std::str::{FromStr};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -12,20 +13,18 @@ use std::thread;
 use std::time::Duration;
 
 use itertools::Itertools;
+use futures::future::{ok, loop_fn, Future, FutureResult, Loop, lazy};
 use serde_json;
 use serde_json::Value;
 use serde_json::error::Error as SerdeJsonError;
+use tokio_zookeeper::*;
+use tokio::prelude::*;
 use url::{Url, ParseError};
-use zookeeper::{
-    Watcher,
-    WatchedEvent,
-    WatchedEventType,
-    ZooKeeper,
-    Stat,
-};
 
 // TODO remove once done debugging
 use std::net::TcpStream;
+
+use failure;
 
 
 use cueball::backend::*;
@@ -100,17 +99,28 @@ enum MachineEvent {
     ReceiveEvent,
 }
 
+#[derive(Debug)]
+enum LoopState {
+    Connect,
+    StopConnectError,
+    Stop,
+    ArmWatch,
+    ReceiveEvent,
+}
+
 /// A simple state machine for internal use. Models the current state of the
 /// ManateePrimaryResolver in regards to zookeeper sessions and watches.
 #[derive(Debug)]
 pub struct StateMachine {
     state: MachineState,
+    zk: Option<ZooKeeper>,
 }
 
 impl StateMachine {
     fn new() -> Self {
         StateMachine {
             state: MachineState::NoSession,
+            zk: None
         }
     }
 
@@ -142,6 +152,14 @@ impl StateMachine {
 
     fn get_state(&self) -> MachineState {
         return self.state.clone();
+    }
+
+    fn get_zk(&self) -> Option<ZooKeeper> {
+        return self.zk.clone();
+    }
+
+    fn set_zk(&mut self, zk: &ZooKeeper) {
+        self.zk = Some(zk.clone());
     }
 }
 
@@ -269,154 +287,262 @@ impl ManateePrimaryResolver {
         last_backend: Arc<Mutex<Option<BackendKey>>>,
         error_arcmut: Arc<Mutex<Option<String>>>
     ) {
-        let event_rx = event_rx.lock().unwrap();
-        let mut machine = StateMachine::new();
-        let mut zk = None;
-        // This is the current zookeeper event we're processing. To start, we
-        // artificially set this to NodeDataChanged because, upon first running,
-        // the resolver should notify the consumer of any available backends
-        let mut curr_event = ResolverEvent::DataChangedEvent;
+        // let mut client;
+        tokio::run(
+            loop_fn(StateMachine::new(), move |machine| {
+                println!("outer looping");
+                let path_clone = cluster_state_path.clone();
+                ZooKeeper::connect(&connect_string.to_string().parse().unwrap())
+                    .and_then(move |(zk, default_watcher)| {
+                        println!("Got zk client: {:?}", zk);
+                        zk
+                            .watch()
+                            .get_data(&path_clone)
+                            .and_then(move |data| {
+                                // loop_fn(true, move |should_watch| {
+                                //     println!("Inner loop: waiting for event");
 
-        // This is the main event-processing loop. In each loop iteration, we
-        // examine the current state of the state machine and take action
-        // accordingly.
-        loop {
-            println!("Top of loop; state: {:?}", machine.get_state());
-            match machine.get_state() {
 
-                // NoSession: Connect to zookeeper
-                MachineState::NoSession => {
-                    let cs = connect_string.to_string();
-                    println!("Attempting to connect");
-                    let machine_event = match ZooKeeper::connect(
-                        &cs,
-                        Duration::from_secs(30),
-                        SessionEventWatcher{
-                            event_tx: event_tx.clone()
-                        }) {
-                        Ok(zookeeper) => {
-                            // TODO whyyyy does this case get hit even when zk is disabled???
-                            println!("Attempt successful!");
-                            zk = Some(zookeeper);
-                            MachineEvent::Connect
-                        },
-                        Err(e) => {
-                            println!("Attempt failed!");
-                            zk = None;
-                            ManateePrimaryResolver::set_error(
-                                Arc::clone(&error_arcmut),
-                                &e
-                            );
-                            MachineEvent::ConnectError
-                        }
-                    };
-                    machine.set_next_state(machine_event)
-                }
 
-                // HandlingEvent: We are connected to zookeeper but haven't set
-                // a watch yet. If we're here, it means that we've received an
-                // event on the channel (except for the first iteration, which
-                // is why we set curr_event artificially). Thus, we process
-                // the event and get ready to receive another event. If the
-                // event is a DataChangedEvent, that means that the watch was
-                // fired, so we need to re-set the watch. Other event types do
-                // not come from watches, so we can just transition to the next
-                // state.
-                MachineState::HandlingEvent => {
-                    let ten_millis = Duration::from_millis(1000);
-                    thread::sleep(ten_millis);
+                                    default_watcher.into_future().and_then(|(item, _)| {
+                                        println!("{:?}", item);
+                                        ok(Loop::Break(()))
+                                    }).map_err(|e| failure::error::Error::from(e))
+                                // })
+                            })
+                            .and_then(|_| {
+                                ok(Loop::Break(()))
+                            })
+                    })
+                    // .map(|_| ())
+                    // .map_err(|e| panic!("{:?}", e))
+                // match machine.get_state() {
 
-                    // The zk client must exist at this point
-                    // TODO account for case where cluster_state_path doesn't
-                    // exist in zk yet -- maybe poll every 30 seconds?
-                    let machine_event;
-                    let zk = zk.as_ref().unwrap();
-                    match curr_event {
-                        // The cluster topology has changed -- we thus
-                        // get the new primary and call process_value.
-                        ResolverEvent::DataChangedEvent => {
-                            machine_event = || -> MachineEvent {
-                                let curr_value;
-                                match zk.get_data_w(
-                                    &cluster_state_path,
-                                    ClusterStateWatcher{
-                                        event_tx: event_tx.clone()
-                                    }) {
+                //     // NoSession: Connect to zookeeper
+                //     MachineState::NoSession => {
+                //         let cs = connect_string.to_string();
+                //         println!("Attempting to connect");
+                //         // TODO connect
+                //         let machine_event = MachineEvent::Connect;
+                //         machine.set_next_state(machine_event)
+                //         ZooKeeper::connect(&connect_string.to_string().parse().unwrap())
+                //             .and_then(|(zk, default_watcher)| {
+                //                 // client = zk;
+                //                 println!("{:?}", zk);
+                //                 Ok((Loop::Continue(machine)))
+                //             })
+                //     }
+                //     _ => panic!("DEAN!");
 
-                                    Ok(data) => {
-                                        curr_value = data;
-                                    },
-                                    Err(e) => {
-                                        ManateePrimaryResolver::set_error(
-                                            Arc::clone(&error_arcmut),
-                                            &e
-                                        );
-                                        // TODO handle error more specifically
-                                        return MachineEvent::ConnectError;
-                                    }
-                                }
-                                let pool_tx_clone = pool_tx.clone();
-                                let backend_clone =
-                                    Arc::clone(&last_backend);
-                                match ManateePrimaryResolver::process_value(
-                                    &pool_tx_clone,
-                                    &curr_value,
-                                    backend_clone) {
-                                    Ok(_) => {
-                                        return MachineEvent::ArmWatch;
-                                    },
-                                    Err(e) => {
-                                        ManateePrimaryResolver::set_error(
-                                            Arc::clone(&error_arcmut),
-                                            &e
-                                        );
-                                        if e.should_stop {
-                                            return MachineEvent::Stop;
-                                        } else {
-                                            return MachineEvent::ArmWatch;
-                                        }
-                                    }
-                                }
-                            }();
-                        },
-                        // The state of our session has changed.
-                        ResolverEvent::SessionEvent => {
-                            println!("oooy!");
-                            machine_event = MachineEvent::ArmWatch;
-                        },
-                        // stop() has been called.
-                        ResolverEvent::StopEvent => {
-                            machine_event = MachineEvent::Stop;
-                        }
-                    }
-                    machine.set_next_state(machine_event);
-                },
+                    // // HandlingEvent: We are connected to zookeeper but haven't set
+                    // // a watch yet. If we're here, it means that we've received an
+                    // // event on the channel (except for the first iteration, which
+                    // // is why we set curr_event artificially). Thus, we process
+                    // // the event and get ready to receive another event. If the
+                    // // event is a DataChangedEvent, that means that the watch was
+                    // // fired, so we need to re-set the watch. Other event types do
+                    // // not come from watches, so we can just transition to the next
+                    // // state.
+                    // MachineState::HandlingEvent => {
+                    //     // The zk client must exist at this point
+                    //     // TODO account for case where cluster_state_path doesn't
+                    //     // exist in zk yet -- maybe poll every 30 seconds?
+                    //     let machine_event;
+                    //     // let zk = zk.as_ref().unwrap();
+                    //     // match curr_event {
+                    //     //     // The cluster topology has changed -- we thus
+                    //     //     // get the new primary and call process_value.
+                    //     //     ResolverEvent::DataChangedEvent => {
+                    //     //         machine_event = || -> MachineEvent {
+                    //     //             let curr_value;
+                    //     //             // TODO get value
+                    //     //             let pool_tx_clone = pool_tx.clone();
+                    //     //             let backend_clone =
+                    //     //                 Arc::clone(&last_backend);
+                    //     //             match ManateePrimaryResolver::process_value(
+                    //     //                 &pool_tx_clone,
+                    //     //                 &curr_value,
+                    //     //                 backend_clone) {
+                    //     //                 Ok(_) => {
+                    //     //                     return MachineEvent::ArmWatch;
+                    //     //                 },
+                    //     //                 Err(e) => {
+                    //     //                     ManateePrimaryResolver::set_error(
+                    //     //                         Arc::clone(&error_arcmut),
+                    //     //                         &e
+                    //     //                     );
+                    //     //                     if e.should_stop {
+                    //     //                         return MachineEvent::Stop;
+                    //     //                     } else {
+                    //     //                         return MachineEvent::ArmWatch;
+                    //     //                     }
+                    //     //                 }
+                    //     //             }
+                    //     //         }();
+                    //     //     },
+                    //     //     // The state of our session has changed.
+                    //     //     ResolverEvent::SessionEvent => {
+                    //     //         println!("   oooy!");
+                    //     //         machine_event = MachineEvent::ArmWatch;
+                    //     //     },
+                    //     //     // stop() has been called.
+                    //     //     ResolverEvent::StopEvent => {
+                    //     //         machine_event = MachineEvent::Stop;
+                    //     //     }
+                    //     // }
+                    //     // machine.set_next_state(machine_event);
+                    //     machine.set_next_state(MachineEvent::ArmWatch);
+                    // },
 
-                // We have nothing to do but wait for something to happen!
-                MachineState::WaitingForEvent => {
-                    match event_rx.recv() {
-                        Ok(event) => {
-                            curr_event = event;
-                            machine.set_next_state(MachineEvent::ReceiveEvent);
-                        },
-                        Err(e) =>
-                            panic!("Internal watcher channel error: {:?}", e)
-                    }
-                },
+                    // // We have nothing to do but wait for something to happen!
+                    // MachineState::WaitingForEvent => {
+                    //     // match event_rx.recv() {
+                    //     //     Ok(event) => {
+                    //     //         curr_event = event;
+                    //     //         machine.set_next_state(MachineEvent::ReceiveEvent);
+                    //     //     },
+                    //     //     Err(e) =>
+                    //     //         panic!("Internal watcher channel error: {:?}", e)
+                    //     // }
+                    //     machine.set_next_state(MachineEvent::ReceiveEvent);
+                    // },
 
-                // stop() has been called or we've encountered an error whose
-                // should_stop field is `true`
-                MachineState::Stopping => {
-                    // Point of no return -- we'll have to call start() again to
-                    // begin receiving events.
-                    //
-                    // There is no need to close the zookeeper client here, as
-                    // its drop() method closes it.
-                    println!("Stopping! Bye bye.");
-                    break;
-                }
-            }
-        }
+                    // // stop() has been called or we've encountered an error whose
+                    // // should_stop field is `true`
+                    // MachineState::Stopping => {
+                    //     // Point of no return -- we'll have to call start() again to
+                    //     // begin receiving events.
+                    //     //
+                    //     // There is no need to close the zookeeper client here, as
+                    //     // its drop() method closes it.
+                    //     println!("Stopping! Bye bye.");
+                    //     let machine_event = MachineEvent::Connect;
+                    //     machine.set_next_state(machine_event)
+                    // }
+                // }
+            }).and_then(|_| {
+                println!("done");
+                Ok(())
+            })
+            .map(|_| ())
+            .map_err(|e| panic!("{:?}", e))
+        );
+        /*
+            loop state:
+                - statemachine state
+                - zookeeper client
+        */
+        // let event_rx = event_rx.lock().unwrap();
+        // let mut machine = StateMachine::new();
+        // let mut zk = None;
+        // // This is the current zookeeper event we're processing. To start, we
+        // // artificially set this to NodeDataChanged because, upon first running,
+        // // the resolver should notify the consumer of any available backends
+        // let mut curr_event = ResolverEvent::DataChangedEvent;
+
+        // // This is the main event-processing loop. In each loop iteration, we
+        // // examine the current state of the state machine and take action
+        // // accordingly.
+        // loop {
+        //     println!("Top of loop; state: {:?}", machine.get_state());
+        //     match machine.get_state() {
+
+        //         // NoSession: Connect to zookeeper
+        //         MachineState::NoSession => {
+        //             let cs = connect_string.to_string();
+        //             println!("Attempting to connect");
+        //             // TODO connect
+        //             let machine_event = MachineEvent::Connect
+        //             machine.set_next_state(machine_event)
+        //         }
+
+        //         // HandlingEvent: We are connected to zookeeper but haven't set
+        //         // a watch yet. If we're here, it means that we've received an
+        //         // event on the channel (except for the first iteration, which
+        //         // is why we set curr_event artificially). Thus, we process
+        //         // the event and get ready to receive another event. If the
+        //         // event is a DataChangedEvent, that means that the watch was
+        //         // fired, so we need to re-set the watch. Other event types do
+        //         // not come from watches, so we can just transition to the next
+        //         // state.
+        //         MachineState::HandlingEvent => {
+        //             let ten_millis = Duration::from_millis(1000);
+        //             thread::sleep(ten_millis);
+
+        //             // The zk client must exist at this point
+        //             // TODO account for case where cluster_state_path doesn't
+        //             // exist in zk yet -- maybe poll every 30 seconds?
+        //             let machine_event;
+        //             let zk = zk.as_ref().unwrap();
+        //             match curr_event {
+        //                 // The cluster topology has changed -- we thus
+        //                 // get the new primary and call process_value.
+        //                 ResolverEvent::DataChangedEvent => {
+        //                     machine_event = || -> MachineEvent {
+        //                         let curr_value;
+        //                         // TODO get value
+        //                         let pool_tx_clone = pool_tx.clone();
+        //                         let backend_clone =
+        //                             Arc::clone(&last_backend);
+        //                         match ManateePrimaryResolver::process_value(
+        //                             &pool_tx_clone,
+        //                             &curr_value,
+        //                             backend_clone) {
+        //                             Ok(_) => {
+        //                                 return MachineEvent::ArmWatch;
+        //                             },
+        //                             Err(e) => {
+        //                                 ManateePrimaryResolver::set_error(
+        //                                     Arc::clone(&error_arcmut),
+        //                                     &e
+        //                                 );
+        //                                 if e.should_stop {
+        //                                     return MachineEvent::Stop;
+        //                                 } else {
+        //                                     return MachineEvent::ArmWatch;
+        //                                 }
+        //                             }
+        //                         }
+        //                     }();
+        //                 },
+        //                 // The state of our session has changed.
+        //                 ResolverEvent::SessionEvent => {
+        //                     println!("   oooy!");
+        //                     machine_event = MachineEvent::ArmWatch;
+        //                 },
+        //                 // stop() has been called.
+        //                 ResolverEvent::StopEvent => {
+        //                     machine_event = MachineEvent::Stop;
+        //                 }
+        //             }
+        //             machine.set_next_state(machine_event);
+        //         },
+
+        //         // We have nothing to do but wait for something to happen!
+        //         MachineState::WaitingForEvent => {
+        //             match event_rx.recv() {
+        //                 Ok(event) => {
+        //                     curr_event = event;
+        //                     machine.set_next_state(MachineEvent::ReceiveEvent);
+        //                 },
+        //                 Err(e) =>
+        //                     panic!("Internal watcher channel error: {:?}", e)
+        //             }
+        //         },
+
+        //         // stop() has been called or we've encountered an error whose
+        //         // should_stop field is `true`
+        //         MachineState::Stopping => {
+        //             // Point of no return -- we'll have to call start() again to
+        //             // begin receiving events.
+        //             //
+        //             // There is no need to close the zookeeper client here, as
+        //             // its drop() method closes it.
+        //             println!("Stopping! Bye bye.");
+        //             break;
+        //         }
+        //     }
+        // }
     }
 
     /// Parses the given zookeeper node data into a Backend object, compares it
@@ -576,43 +702,43 @@ impl Resolver for ManateePrimaryResolver {
 }
 
 
-struct SessionEventWatcher {
-    event_tx: Sender<ResolverEvent>,
-}
+// struct SessionEventWatcher {
+//     event_tx: Sender<ResolverEvent>,
+// }
 
-impl Watcher for SessionEventWatcher {
-    fn handle(&self, e: WatchedEvent) {
-        println!("{:?}", e);
-        // Zookeeper session state changes should have WatchedEventType::None,
-        // so we assert this fact
-        match e.event_type {
-            WatchedEventType::None =>
-                // This is an internal channel that we manage, so we expect
-                // sending to succeed
-                self.event_tx.send(ResolverEvent::SessionEvent).unwrap(),
-            _ => panic!("Unexpected event type: {:?}", e.event_type)
-        };
-    }
-}
+// impl Watcher for SessionEventWatcher {
+//     fn handle(&self, e: WatchedEvent) {
+//         println!("{:?}", e);
+//         // Zookeeper session state changes should have WatchedEventType::None,
+//         // so we assert this fact
+//         match e.event_type {
+//             WatchedEventType::None =>
+//                 // This is an internal channel that we manage, so we expect
+//                 // sending to succeed
+//                 self.event_tx.send(ResolverEvent::SessionEvent).unwrap(),
+//             _ => panic!("Unexpected event type: {:?}", e.event_type)
+//         };
+//     }
+// }
 
-struct ClusterStateWatcher {
-    event_tx: Sender<ResolverEvent>,
-}
+// struct ClusterStateWatcher {
+//     event_tx: Sender<ResolverEvent>,
+// }
 
-impl Watcher for ClusterStateWatcher {
-    fn handle(&self, e: WatchedEvent) {
-        // We only ever register this Watcher for data changes on the cluster
-        // state node, so we assert that the received event is of type
-        // WatchedEventType::NodeDataChanged
-        match e.event_type {
-            WatchedEventType::NodeDataChanged =>
-                // This is an internal channel that we manage, so we expect
-                // sending to succeed
-                self.event_tx.send(ResolverEvent::DataChangedEvent).unwrap(),
-            _ => panic!("Unexpected event type: {:?}", e.event_type)
-        };
-    }
-}
+// impl Watcher for ClusterStateWatcher {
+//     fn handle(&self, e: WatchedEvent) {
+//         // We only ever register this Watcher for data changes on the cluster
+//         // state node, so we assert that the received event is of type
+//         // WatchedEventType::NodeDataChanged
+//         match e.event_type {
+//             WatchedEventType::NodeDataChanged =>
+//                 // This is an internal channel that we manage, so we expect
+//                 // sending to succeed
+//                 self.event_tx.send(ResolverEvent::DataChangedEvent).unwrap(),
+//             _ => panic!("Unexpected event type: {:?}", e.event_type)
+//         };
+//     }
+// }
 
 
 #[cfg(test)]
