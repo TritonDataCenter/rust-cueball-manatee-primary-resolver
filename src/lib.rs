@@ -623,14 +623,14 @@ impl Resolver for ManateePrimaryResolver {
         local_runtime.unwrap().shutdown_now().wait().unwrap();
     }
 
-    fn get_last_error(&self) -> Option<String> {
-        if let Some(err) = &*self.error.lock().unwrap() {
-                let err_str = format!("{}", err);
-                Some(err_str)
-        } else {
-            None
-        }
-    }
+    // fn get_last_error(&self) -> Option<String> {
+    //     if let Some(err) = &*self.error.lock().unwrap() {
+    //             let err_str = format!("{}", err);
+    //             Some(err_str)
+    //     } else {
+    //         None
+    //     }
+    // }
 }
 
 #[cfg(test)]
