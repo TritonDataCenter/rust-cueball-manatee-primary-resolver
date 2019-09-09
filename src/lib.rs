@@ -3,29 +3,27 @@
  */
 
 use std::convert::From;
-use std::fmt::Debug;
+use std::error::Error;
+use std::fmt;
+use std::fmt::{Debug, Display};
+use std::mem;
 use std::net::{AddrParseError, SocketAddr};
-use std::rc::Rc;
 use std::str::{FromStr};
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use itertools::Itertools;
-use futures::future::{ok, loop_fn, Future, FutureResult, Loop, lazy};
+use futures::future::{ok, loop_fn, Either, Future, Loop, lazy};
 use serde_json;
 use serde_json::Value;
 use serde_json::error::Error as SerdeJsonError;
 use tokio_zookeeper::*;
 use tokio::prelude::*;
+use tokio::runtime::Runtime;
+use tokio::timer::Delay;
+use tokio::timer::Error as TimerError;
 use url::{Url, ParseError};
-
-// TODO remove once done debugging
-use std::net::TcpStream;
-
-use failure;
-
 
 use cueball::backend::*;
 use cueball::resolver::{
@@ -35,8 +33,15 @@ use cueball::resolver::{
     Resolver
 };
 
+const RECONNECT_DELAY: Duration = Duration::from_secs(10);
+const RECONNECT_NODELAY: Duration = Duration::from_secs(0);
+const INNER_LOOP_DELAY: Duration = Duration::from_secs(10);
+const INNER_LOOP_NODELAY: Duration = Duration::from_secs(10);
+
+
 // TODO make sure set_error is being called everywhere there's a client-facing
 // error
+// TODO add logging
 
 // An error type to be used internally.
 // The "should_stop" field indicates whether the Resolver should stop() in
@@ -47,6 +52,13 @@ pub struct ResolverError {
     message: String,
     should_stop: bool
 }
+
+impl Display for ResolverError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "ResolverError: {:?}, {:?}", self.message, self.should_stop)
+    }
+}
+
 
 impl From<ParseError> for ResolverError {
     fn from(e: ParseError) -> Self {
@@ -75,94 +87,7 @@ impl From<AddrParseError> for ResolverError {
     }
 }
 
-#[derive(Debug, Clone)]
-enum ResolverEvent {
-    StopEvent,
-    DataChangedEvent,
-    SessionEvent,
-}
-
-#[derive(Debug, Clone)]
-enum MachineState {
-    NoSession,
-    HandlingEvent,
-    WaitingForEvent,
-    Stopping,
-}
-
-#[derive(Debug)]
-enum MachineEvent {
-    Connect,
-    ConnectError,
-    Stop,
-    ArmWatch,
-    ReceiveEvent,
-}
-
-#[derive(Debug)]
-enum LoopState {
-    Connect,
-    StopConnectError,
-    Stop,
-    ArmWatch,
-    ReceiveEvent,
-}
-
-/// A simple state machine for internal use. Models the current state of the
-/// ManateePrimaryResolver in regards to zookeeper sessions and watches.
-#[derive(Debug)]
-pub struct StateMachine {
-    state: MachineState,
-    zk: Option<ZooKeeper>,
-}
-
-impl StateMachine {
-    fn new() -> Self {
-        StateMachine {
-            state: MachineState::NoSession,
-            zk: None
-        }
-    }
-
-    /// Given an event, transitions to the next state. The match statement below
-    /// is the definitive source for state transitions.
-    fn set_next_state(&mut self, event: MachineEvent) {
-        let next = match (&self.state, event) {
-            (MachineState::NoSession, MachineEvent::Connect) =>
-                MachineState::HandlingEvent,
-            (MachineState::NoSession, MachineEvent::ConnectError) =>
-                MachineState::NoSession,
-            (MachineState::HandlingEvent, MachineEvent::ConnectError) =>
-                MachineState::NoSession,
-            (MachineState::HandlingEvent, MachineEvent::Stop) =>
-                MachineState::Stopping,
-            (MachineState::HandlingEvent, MachineEvent::ArmWatch) =>
-                MachineState::WaitingForEvent,
-            (MachineState::WaitingForEvent, MachineEvent::ReceiveEvent) =>
-                MachineState::HandlingEvent,
-            (MachineState::WaitingForEvent, MachineEvent::ConnectError) =>
-                MachineState::NoSession,
-            (s, e) =>
-                panic!(
-                    "Invalid MachineState/MachineEvent pair: {:?}, {:?}", s, e
-                ),
-        };
-        self.state = next;
-    }
-
-    fn get_state(&self) -> MachineState {
-        return self.state.clone();
-    }
-
-    fn get_zk(&self) -> Option<ZooKeeper> {
-        return self.zk.clone();
-    }
-
-    fn set_zk(&mut self, zk: &ZooKeeper) {
-        self.zk = Some(zk.clone());
-    }
-}
-
+/// `ZKConnectString` represents a list of zookeeper addresses to connect to.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ZKConnectString(Vec<SocketAddr>);
 
@@ -200,37 +125,29 @@ impl FromStr for ZKConnectString {
 
 #[derive(Debug)]
 pub struct ManateePrimaryResolver {
-    /// An instance of the ZKConnectString type that represents a Zookeeper
-    /// connection string
+    /// The addresses of the Zookeeper cluster the Resolver is connecting to
     connect_string: ZKConnectString,
     /// The Zookeeper path for manatee cluster state for the shard. *e.g.*
     /// "/manatee/1.moray.coal.joyent.us/state"
     cluster_state_path: String,
     /// The communications channel with the cueball connection pool
     pool_tx: Option<Sender<BackendMsg>>,
-    /// The Sender end of a channel for internal communication between threads
-    event_tx: Sender<ResolverEvent>,
-    /// The Receiver corresponding to `event_tx` above. Protected by an
-    /// Arc/Mutex because the channel must be used by various threads in various
-    /// methods, and, unlike with the Sender end, we can't handle Recevier
-    /// ownership by cloning it.
-    event_rx: Arc<Mutex<Receiver<ResolverEvent>>>,
-    /// The last error that occurred. Protected by an Arc/Mutex because it is
-    /// accessed by multiple internal threads.
+    /// The last error that occurred. Persists across start()/stop() of a given
+    /// ManateePrimaryResolver instance.
     error: Arc<Mutex<Option<String>>>,
     /// The key representation of the last backend sent to the cueball
-    /// connection pool. Protected by an Arc/Mutex because it is
-    /// accessed by the background thread in run(), but must be persistently
-    /// stored across starts/stops in this struct.
+    /// connection pool. Persists across start()/stop() of a given
+    /// ManateePrimaryResolver instance.
     last_backend: Arc<Mutex<Option<BackendKey>>>,
-    /// Indicates if the resolver is running. Protected by an Arc/Mutex because
-    /// it is accessed by multiple internal threads.
-    running: Arc<Mutex<bool>>,
+    /// The tokio Runtime struct that powers the Resolver. We save a handle so
+    /// we can kill the background tasks when calling stop().
+    /// The following invariant is maintained: If `runtime` is not None, the
+    /// Resolver is running. if `runtime` is None, the resolver is stopped.
+    runtime: Arc<Mutex<Option<Runtime>>>,
 }
 
 impl ManateePrimaryResolver {
-
-    /// Creates a new ManateePrimaryResolver instance
+    /// Creates a new ManateePrimaryResolver instance.
     ///
     /// # Arguments
     ///
@@ -244,18 +161,15 @@ impl ManateePrimaryResolver {
     ) -> Self
     {
         // TODO change 'dean' to 'state' once you're done testing
-        let cluster_state_path = [&path, "/dean"].concat();
-        let (tx, rx) = channel();
+        let cluster_state_path = [&path, "/dea"].concat();
 
         ManateePrimaryResolver {
             connect_string,
             cluster_state_path,
             pool_tx: None,
-            event_tx: tx,
-            event_rx: Arc::new(Mutex::new(rx)),
             error: Arc::new(Mutex::new(None)),
             last_backend: Arc::new(Mutex::new(None)),
-            running: Arc::new(Mutex::new(false)),
+            runtime: Arc::new(Mutex::new(None))
         }
     }
 
@@ -271,278 +185,276 @@ impl ManateePrimaryResolver {
     ///   we're watching
     /// * `pool_tx` - The Sender that this function should use to communicate
     ///   with the cueball connection pool
-    /// * `event_tx` - The sender that this function should pass to watch
-    ///   handlers, so they can transmit events back
-    /// * `event_rx` - The receiver paired with `event_tx`.
-    ///   arbitrarily.
     /// * `last_backend` - The key representation of the last backend sent to
     ///   the cueball connection pool. It will be updated by process_value() if
     ///   we send a new backend over.
+    /// * `error_arcmut` The Arc/Mutex in which the function should store the
+    ///   most recent error encountered, required to implement the
+    ///   get_last_error method. This value will be updated by set_error() if we
+    ///   encounter an error.
     fn run(
         connect_string: ZKConnectString,
         cluster_state_path: String,
         pool_tx: Sender<BackendMsg>,
-        event_tx: Sender<ResolverEvent>,
-        event_rx: Arc<Mutex<Receiver<ResolverEvent>>>,
         last_backend: Arc<Mutex<Option<BackendKey>>>,
         error_arcmut: Arc<Mutex<Option<String>>>
     ) {
-        // let mut client;
-        tokio::run(
-            loop_fn(StateMachine::new(), move |machine| {
-                println!("outer looping");
-                let path_clone = cluster_state_path.clone();
-                ZooKeeper::connect(&connect_string.to_string().parse().unwrap())
+        // The inner event-processing loop returns this enum to the outer
+        // connection managing loop to indicate whether the Resolver should
+        // reconnect or stop.
+        enum NextAction {
+            // The Duration field is the amount of time to wait before
+            // reconnecting.
+            Reconnect(Duration),
+            Stop,
+        }
+
+        struct InnerLoopState {
+            watcher: Box<dyn futures::stream::Stream<Item = WatchedEvent, Error = ()> + Send>,
+            event: WatchedEvent,
+            delay: Duration
+        }
+
+        tokio::spawn(lazy(move ||{
+            // Outer loop. Handles connecting to zookeeper. A new loop iteration
+            // means a new zookeeper connection. Breaking from the loop means
+            // that the client is stopping.
+            //
+            // Arg: Time to wait before attempting to connect. Initially 0s.
+            //     Repeated iterations of the loop set a delay before
+            //     connecting.
+            // Loop::Break type: ()
+            loop_fn(Duration::from_secs(0), move |wait_period| {
+                let pool_tx = pool_tx.clone();
+                let last_backend = Arc::clone(&last_backend);
+                let error_arcmut = Arc::clone(&error_arcmut);
+                let error_arcmut_orelse = Arc::clone(&error_arcmut);
+                let connect_string = connect_string.clone();
+                let cluster_state_path = cluster_state_path.clone();
+
+                let run_connect = move |_| {
+                    ZooKeeper::connect(&connect_string.to_string().parse().unwrap())
                     .and_then(move |(zk, default_watcher)| {
-                        println!("Got zk client: {:?}", zk);
-                        zk
-                            .watch()
-                            .get_data(&path_clone)
-                            .and_then(move |data| {
-                                // loop_fn(true, move |should_watch| {
-                                //     println!("Inner loop: waiting for event");
+                        // State: Connected
+                        println!("Connected to zk client");
 
+                        // Main change-watching loop. A new loop iteration means
+                        // we're setting a new watch (if necessary) and waiting
+                        // for a result. Breaking from the loop means that we've
+                        // hit some error and are returning control to the outer
+                        // loop.
+                        //
+                        // This loop can return from two states: before we've
+                        // waited for the watch to fire (if we hit an error
+                        // before waiting), or after we've waited for the watch
+                        // to fire (this could be a success or an error). These
+                        // two states require returning different Future types,
+                        // so we wrap the returned values in a future::Either to
+                        // satisfy the type checker.
+                        //
+                        // Arg: (watcher Stream object, event we're
+                        //     currently processing) -- we set curr_event to
+                        //     an artificially constructed WatchedEvent for the
+                        //     first loop iteration, so the connection pool will
+                        //     be initialized with the initial primary as its
+                        //     backend.
+                        // Loop::Break type: NextAction -- this value is used to
+                        //     instruct the outer loop whether to try to
+                        //     reconnect or terminate.
+                        loop_fn(InnerLoopState {
+                            watcher: Box::new(default_watcher),
+                            event: WatchedEvent {
+                                event_type: WatchedEventType::NodeDataChanged,
+                                // This initial artificial keeper_state doesn't
+                                // necessarily reflect reality, but that's ok
+                                // because it's paired with an artificial
+                                // NodeDataChanged event, and our handling for
+                                // this type of event doesn't involve the
+                                // keeper_state field.
+                                keeper_state: KeeperState::SyncConnected,
+                                // We never use path, so we might as well set it
+                                // to an empty string in our artificially
+                                // constructed bootstrap WatchedEvent object.
+                                path: "".to_string(),
+                            },
+                            delay: INNER_LOOP_NODELAY
+                        } , move |loop_state| {
+                            let watcher = loop_state.watcher;
+                            let curr_event = loop_state.event;
+                            let delay = loop_state.delay;
+                            let when = Instant::now() + delay;
 
+                            println!("Getting data; watching for changes");
 
-                                    default_watcher.into_future().and_then(|(item, _)| {
-                                        println!("{:?}", item);
-                                        ok(Loop::Break(()))
-                                    }).map_err(|e| failure::error::Error::from(e))
-                                // })
+                            let pool_tx = pool_tx.clone();
+                            let last_backend = Arc::clone(&last_backend);
+                            let error_arcmut = Arc::clone(&error_arcmut);
+                            let error_arcmut_orelse = Arc::clone(&error_arcmut);
+                            // State: Watch unarmed
+
+                            // We set the watch here. If the previous iteration
+                            // of the loop ended because the keeper state
+                            // changed rather than because the watch fired, the
+                            // watch will already have been set, so we don't
+                            // _need_ to set it here. With that said, it does
+                            // no harm (zookeeper deduplicates watches on the
+                            // server side), and it may not be worth the effort
+                            // to optimize for this case, since keeper state
+                            // changes (and, indeed, changes of any sort) should
+                            // happen infrequently.
+                            let cluster_state_path = cluster_state_path.clone();
+                            let zk = zk.clone();
+                            Delay::new(when)
+                            .and_then(move |_| {
+                                zk
+                                .watch()
+                                .get_data(&cluster_state_path)
+                                .and_then(move |(_, data)| {
+                                    match curr_event.event_type {
+                                        // Keeper state has changed
+                                        WatchedEventType::None => {
+                                            println!("Keeper state changed to: {:?}", curr_event.keeper_state);
+                                            match curr_event.keeper_state {
+                                                KeeperState::Disconnected |
+                                                KeeperState::AuthFailed |
+                                                KeeperState::Expired => {
+                                                    ManateePrimaryResolver::set_error(
+                                                        Arc::clone(&error_arcmut),
+                                                        &format!("Reconnect initiated; Keeper state changed to: {:?}",
+                                                            curr_event.keeper_state)
+                                                    );
+                                                    return Either::A(ok(Loop::Break(
+                                                        NextAction::Reconnect(
+                                                        RECONNECT_NODELAY))));
+                                                },
+                                                KeeperState::SyncConnected |
+                                                KeeperState::ConnectedReadOnly |
+                                                KeeperState::SaslAuthenticated => {}
+                                            }
+                                        },
+                                        // The data watch fired
+                                        WatchedEventType::NodeDataChanged => {
+                                            // We didn't get the data, which means
+                                            // the node doesn't exist yet. We should
+                                            // wait a bit and try again. We'll just
+                                            // use the same event as before.
+                                            if let None = data {
+                                                return Either::A(ok(Loop::Continue(
+                                                    InnerLoopState {
+                                                        watcher: watcher,
+                                                        event: curr_event,
+                                                        delay: INNER_LOOP_DELAY
+                                                    })));
+                                            }
+                                            match ManateePrimaryResolver::process_value(
+                                                &pool_tx.clone(),
+                                                &data.unwrap(),
+                                                Arc::clone(&last_backend)) {
+                                                Ok(_) => {},
+                                                Err(e) => {
+                                                    ManateePrimaryResolver::set_error(
+                                                        Arc::clone(&error_arcmut),
+                                                        &e
+                                                    );
+                                                    // The error is between the client and the outward-facing channel,
+                                                    // not between the client and the zookeeper connection, so we
+                                                    // don't have to attempt to reconnect here and can continue, unless
+                                                    // the error tells us to stop.
+                                                    if e.should_stop {
+                                                        return Either::A(ok(Loop::Break(NextAction::Stop)));
+                                                    }
+                                                }
+                                            }
+                                        },
+                                        e => panic!("Unexpected event received: {:?}", e)
+                                    };
+
+                                    // If we got here, we're waiting for the watch
+                                    // to fire. Before this point, we wrap the
+                                    // return value in Either::A. After this point,
+                                    // we wrap the return value in Either::B.
+
+                                    Either::B(watcher
+                                        .into_future()
+                                        .and_then(move |(event, watcher)| {
+                                        // match event {
+                                        //     Some (event) => {
+                                            // TODO I _believe_ it's valid to unwrap here,
+                                            // because we control the watcher and thus the
+                                            // stream should never close. Must verify this!
+                                            ok(Loop::Continue(InnerLoopState {
+                                                watcher: watcher,
+                                                event: event.unwrap(),
+                                                delay: INNER_LOOP_NODELAY
+                                            }))
+                                        //     },
+                                        //     None => {
+                                        //         // State: event Stream closed.
+                                        //         // Given that we control the
+                                        //         // We try to reconnect.
+                                        //         println!("Event stream closed");
+                                        //         ManateePrimaryResolver::set_error(
+                                        //             Arc::clone(&error_arcmut),
+                                        //             &"blah"
+                                        //         );
+                                        //         ok(Loop::Break(
+                                        //             NextAction::Reconnect))
+                                        //     }
+                                        // }
+                                        })
+                                        .map_err(|_| {
+                                            // TODO is this assertion correct?
+                                            panic!("This should never happen");
+                                        }))
+                                })
+                                // If some error occurred getting the data,
+                                // we assume we should reconnect to the
+                                // zookeeper server.
+                                .or_else(move |error| {
+                                    ManateePrimaryResolver::set_error(
+                                        Arc::clone(&error_arcmut_orelse),
+                                        &error
+                                    );
+                                    ok(Loop::Break(NextAction::Reconnect(RECONNECT_NODELAY)))
+                                })
                             })
-                            .and_then(|_| {
-                                ok(Loop::Break(()))
+                            .map_err(|e| panic!("delay errored; err: {:?}", e))
+                        })
+                        .and_then(|next_action| {
+                            ok(match next_action {
+                                NextAction::Stop => Loop::Break(()),
+                                // We reconnect immediately here instead of
+                                // waiting, because if we're here it means that
+                                // we came from the inner loop and thus we just
+                                // had a valid connection terminate (as opposed
+                                // to the `or_else` block below, were we've just
+                                // tried to connect and failed), and thus
+                                // there's no reason for us to delay trying to
+                                // connect again.
+                                NextAction::Reconnect(delay) => Loop::Continue(
+                                    delay)
                             })
+                        })
                     })
-                    // .map(|_| ())
-                    // .map_err(|e| panic!("{:?}", e))
-                // match machine.get_state() {
+                    .or_else(move |error| {
+                        ManateePrimaryResolver::set_error(
+                            Arc::clone(&error_arcmut_orelse),
+                            &error
+                        );
+                        ok(Loop::Continue(RECONNECT_DELAY))
+                    })
+                };
 
-                //     // NoSession: Connect to zookeeper
-                //     MachineState::NoSession => {
-                //         let cs = connect_string.to_string();
-                //         println!("Attempting to connect");
-                //         // TODO connect
-                //         let machine_event = MachineEvent::Connect;
-                //         machine.set_next_state(machine_event)
-                //         ZooKeeper::connect(&connect_string.to_string().parse().unwrap())
-                //             .and_then(|(zk, default_watcher)| {
-                //                 // client = zk;
-                //                 println!("{:?}", zk);
-                //                 Ok((Loop::Continue(machine)))
-                //             })
-                //     }
-                //     _ => panic!("DEAN!");
-
-                    // // HandlingEvent: We are connected to zookeeper but haven't set
-                    // // a watch yet. If we're here, it means that we've received an
-                    // // event on the channel (except for the first iteration, which
-                    // // is why we set curr_event artificially). Thus, we process
-                    // // the event and get ready to receive another event. If the
-                    // // event is a DataChangedEvent, that means that the watch was
-                    // // fired, so we need to re-set the watch. Other event types do
-                    // // not come from watches, so we can just transition to the next
-                    // // state.
-                    // MachineState::HandlingEvent => {
-                    //     // The zk client must exist at this point
-                    //     // TODO account for case where cluster_state_path doesn't
-                    //     // exist in zk yet -- maybe poll every 30 seconds?
-                    //     let machine_event;
-                    //     // let zk = zk.as_ref().unwrap();
-                    //     // match curr_event {
-                    //     //     // The cluster topology has changed -- we thus
-                    //     //     // get the new primary and call process_value.
-                    //     //     ResolverEvent::DataChangedEvent => {
-                    //     //         machine_event = || -> MachineEvent {
-                    //     //             let curr_value;
-                    //     //             // TODO get value
-                    //     //             let pool_tx_clone = pool_tx.clone();
-                    //     //             let backend_clone =
-                    //     //                 Arc::clone(&last_backend);
-                    //     //             match ManateePrimaryResolver::process_value(
-                    //     //                 &pool_tx_clone,
-                    //     //                 &curr_value,
-                    //     //                 backend_clone) {
-                    //     //                 Ok(_) => {
-                    //     //                     return MachineEvent::ArmWatch;
-                    //     //                 },
-                    //     //                 Err(e) => {
-                    //     //                     ManateePrimaryResolver::set_error(
-                    //     //                         Arc::clone(&error_arcmut),
-                    //     //                         &e
-                    //     //                     );
-                    //     //                     if e.should_stop {
-                    //     //                         return MachineEvent::Stop;
-                    //     //                     } else {
-                    //     //                         return MachineEvent::ArmWatch;
-                    //     //                     }
-                    //     //                 }
-                    //     //             }
-                    //     //         }();
-                    //     //     },
-                    //     //     // The state of our session has changed.
-                    //     //     ResolverEvent::SessionEvent => {
-                    //     //         println!("   oooy!");
-                    //     //         machine_event = MachineEvent::ArmWatch;
-                    //     //     },
-                    //     //     // stop() has been called.
-                    //     //     ResolverEvent::StopEvent => {
-                    //     //         machine_event = MachineEvent::Stop;
-                    //     //     }
-                    //     // }
-                    //     // machine.set_next_state(machine_event);
-                    //     machine.set_next_state(MachineEvent::ArmWatch);
-                    // },
-
-                    // // We have nothing to do but wait for something to happen!
-                    // MachineState::WaitingForEvent => {
-                    //     // match event_rx.recv() {
-                    //     //     Ok(event) => {
-                    //     //         curr_event = event;
-                    //     //         machine.set_next_state(MachineEvent::ReceiveEvent);
-                    //     //     },
-                    //     //     Err(e) =>
-                    //     //         panic!("Internal watcher channel error: {:?}", e)
-                    //     // }
-                    //     machine.set_next_state(MachineEvent::ReceiveEvent);
-                    // },
-
-                    // // stop() has been called or we've encountered an error whose
-                    // // should_stop field is `true`
-                    // MachineState::Stopping => {
-                    //     // Point of no return -- we'll have to call start() again to
-                    //     // begin receiving events.
-                    //     //
-                    //     // There is no need to close the zookeeper client here, as
-                    //     // its drop() method closes it.
-                    //     println!("Stopping! Bye bye.");
-                    //     let machine_event = MachineEvent::Connect;
-                    //     machine.set_next_state(machine_event)
-                    // }
-                // }
+                let when = Instant::now() + wait_period;
+                Delay::new(when)
+                .and_then(run_connect)
+                .map_err(|e| panic!("delay errored; err: {:?}", e))
             }).and_then(|_| {
-                println!("done");
+                println!("stopping!");
                 Ok(())
             })
             .map(|_| ())
-            .map_err(|e| panic!("{:?}", e))
-        );
-        /*
-            loop state:
-                - statemachine state
-                - zookeeper client
-        */
-        // let event_rx = event_rx.lock().unwrap();
-        // let mut machine = StateMachine::new();
-        // let mut zk = None;
-        // // This is the current zookeeper event we're processing. To start, we
-        // // artificially set this to NodeDataChanged because, upon first running,
-        // // the resolver should notify the consumer of any available backends
-        // let mut curr_event = ResolverEvent::DataChangedEvent;
-
-        // // This is the main event-processing loop. In each loop iteration, we
-        // // examine the current state of the state machine and take action
-        // // accordingly.
-        // loop {
-        //     println!("Top of loop; state: {:?}", machine.get_state());
-        //     match machine.get_state() {
-
-        //         // NoSession: Connect to zookeeper
-        //         MachineState::NoSession => {
-        //             let cs = connect_string.to_string();
-        //             println!("Attempting to connect");
-        //             // TODO connect
-        //             let machine_event = MachineEvent::Connect
-        //             machine.set_next_state(machine_event)
-        //         }
-
-        //         // HandlingEvent: We are connected to zookeeper but haven't set
-        //         // a watch yet. If we're here, it means that we've received an
-        //         // event on the channel (except for the first iteration, which
-        //         // is why we set curr_event artificially). Thus, we process
-        //         // the event and get ready to receive another event. If the
-        //         // event is a DataChangedEvent, that means that the watch was
-        //         // fired, so we need to re-set the watch. Other event types do
-        //         // not come from watches, so we can just transition to the next
-        //         // state.
-        //         MachineState::HandlingEvent => {
-        //             let ten_millis = Duration::from_millis(1000);
-        //             thread::sleep(ten_millis);
-
-        //             // The zk client must exist at this point
-        //             // TODO account for case where cluster_state_path doesn't
-        //             // exist in zk yet -- maybe poll every 30 seconds?
-        //             let machine_event;
-        //             let zk = zk.as_ref().unwrap();
-        //             match curr_event {
-        //                 // The cluster topology has changed -- we thus
-        //                 // get the new primary and call process_value.
-        //                 ResolverEvent::DataChangedEvent => {
-        //                     machine_event = || -> MachineEvent {
-        //                         let curr_value;
-        //                         // TODO get value
-        //                         let pool_tx_clone = pool_tx.clone();
-        //                         let backend_clone =
-        //                             Arc::clone(&last_backend);
-        //                         match ManateePrimaryResolver::process_value(
-        //                             &pool_tx_clone,
-        //                             &curr_value,
-        //                             backend_clone) {
-        //                             Ok(_) => {
-        //                                 return MachineEvent::ArmWatch;
-        //                             },
-        //                             Err(e) => {
-        //                                 ManateePrimaryResolver::set_error(
-        //                                     Arc::clone(&error_arcmut),
-        //                                     &e
-        //                                 );
-        //                                 if e.should_stop {
-        //                                     return MachineEvent::Stop;
-        //                                 } else {
-        //                                     return MachineEvent::ArmWatch;
-        //                                 }
-        //                             }
-        //                         }
-        //                     }();
-        //                 },
-        //                 // The state of our session has changed.
-        //                 ResolverEvent::SessionEvent => {
-        //                     println!("   oooy!");
-        //                     machine_event = MachineEvent::ArmWatch;
-        //                 },
-        //                 // stop() has been called.
-        //                 ResolverEvent::StopEvent => {
-        //                     machine_event = MachineEvent::Stop;
-        //                 }
-        //             }
-        //             machine.set_next_state(machine_event);
-        //         },
-
-        //         // We have nothing to do but wait for something to happen!
-        //         MachineState::WaitingForEvent => {
-        //             match event_rx.recv() {
-        //                 Ok(event) => {
-        //                     curr_event = event;
-        //                     machine.set_next_state(MachineEvent::ReceiveEvent);
-        //                 },
-        //                 Err(e) =>
-        //                     panic!("Internal watcher channel error: {:?}", e)
-        //             }
-        //         },
-
-        //         // stop() has been called or we've encountered an error whose
-        //         // should_stop field is `true`
-        //         MachineState::Stopping => {
-        //             // Point of no return -- we'll have to call start() again to
-        //             // begin receiving events.
-        //             //
-        //             // There is no need to close the zookeeper client here, as
-        //             // its drop() method closes it.
-        //             println!("Stopping! Bye bye.");
-        //             break;
-        //         }
-        //     }
-        // }
+        }));
     }
 
     /// Parses the given zookeeper node data into a Backend object, compares it
@@ -633,6 +545,8 @@ impl ManateePrimaryResolver {
                     });
                 }
             }
+        } else {
+            println!("Value is same; not sending");
         }
         Ok(())
     }
@@ -649,46 +563,64 @@ impl ManateePrimaryResolver {
 impl Resolver for ManateePrimaryResolver {
 
     fn start(&mut self, s: Sender<BackendMsg>) {
-        let mut is_running = self.running.lock().unwrap();
-        if *is_running {
+        // If self.runtime is not None, the Resolver is running, so we can
+        // return here without doing anything.
+        let mut runtime = self.runtime.lock().unwrap();
+        if let Some(_) = *runtime {
             return;
         }
 
         let s_clone = s.clone();
-        let zk_connect_string = self.connect_string.clone();
+        let connect_string = self.connect_string.clone();
         let cluster_state_path = self.cluster_state_path.clone();
-        let tx_clone = self.event_tx.clone();
-        let rx_clone = Arc::clone(&self.event_rx);
-        let backend_clone = Arc::clone(&self.last_backend);
-        let error_clone = Arc::clone(&self.error);
+        let last_backend = Arc::clone(&self.last_backend);
+        let error = Arc::clone(&self.error);
 
-        // Spawn the background thread that watches for changes
-        thread::spawn(move || {
+        let mut rt = Runtime::new().unwrap();
+
+        // Start the background event-processing task
+        rt.spawn(lazy(|| {
             ManateePrimaryResolver::run(
-                zk_connect_string,
+                connect_string,
                 cluster_state_path,
                 s_clone,
-                tx_clone,
-                rx_clone,
-                backend_clone,
-                error_clone)
-        });
+                last_backend,
+                error);
+            Ok(())
+        }));
 
+        // Save the required persistent state
         self.pool_tx = Some(s);
-        *is_running = true;
+        *runtime = Some(rt)
     }
 
     fn stop(&mut self) {
-        let mut is_running = self.running.lock().unwrap();
-        if !*is_running {
+        let mut runtime = self.runtime.lock().unwrap();
+        // If self.runtime is None, the Resolver is stopped, so we can return
+        // here without doing anyting.
+        if let None = *runtime {
             return;
         }
 
-        // Notify the background thread that it should stop
-        if let Err(e) = self.event_tx.send(ResolverEvent::StopEvent) {
-            panic!("Error sending stop message over internal channel: {:?}", e);
-        }
-        *is_running = false;
+        // Fun with the borrow checker:
+        //
+        // Calling shutdown_now() moves the Runtime struct out of the mutex.
+        // That's not allowed because Runtime doesn't implement Copy, and we
+        // can't clone the Runtime because Runtime doesn't implement Clone. It's
+        // actually be totally safe to move the Runtime out of the mutex here,
+        // because we intend to write a new value to the mutex later in this
+        // function, but the compiler doesn't know that. What we _can_ do is
+        // use mem::replace to move the Runtime and write a new value in one
+        // motion, so the mutex always has a valid value. Believe it or not,
+        // this is all safe. Very cool, I think!
+        let local_runtime = mem::replace(&mut *runtime, None);
+        // Furthermore, if we got here, local_runtime isn't None, because
+        // *runtime wasn't None, so we can unwrap local_runtime.
+        //
+        // We can also unwrap shutdown_now().wait(), because, as I understand
+        // it, shutdown_now cannot return an error. Indeed, the error type is
+        // ().
+        local_runtime.unwrap().shutdown_now().wait().unwrap();
     }
 
     fn get_last_error(&self) -> Option<String> {
@@ -700,46 +632,6 @@ impl Resolver for ManateePrimaryResolver {
         }
     }
 }
-
-
-// struct SessionEventWatcher {
-//     event_tx: Sender<ResolverEvent>,
-// }
-
-// impl Watcher for SessionEventWatcher {
-//     fn handle(&self, e: WatchedEvent) {
-//         println!("{:?}", e);
-//         // Zookeeper session state changes should have WatchedEventType::None,
-//         // so we assert this fact
-//         match e.event_type {
-//             WatchedEventType::None =>
-//                 // This is an internal channel that we manage, so we expect
-//                 // sending to succeed
-//                 self.event_tx.send(ResolverEvent::SessionEvent).unwrap(),
-//             _ => panic!("Unexpected event type: {:?}", e.event_type)
-//         };
-//     }
-// }
-
-// struct ClusterStateWatcher {
-//     event_tx: Sender<ResolverEvent>,
-// }
-
-// impl Watcher for ClusterStateWatcher {
-//     fn handle(&self, e: WatchedEvent) {
-//         // We only ever register this Watcher for data changes on the cluster
-//         // state node, so we assert that the received event is of type
-//         // WatchedEventType::NodeDataChanged
-//         match e.event_type {
-//             WatchedEventType::NodeDataChanged =>
-//                 // This is an internal channel that we manage, so we expect
-//                 // sending to succeed
-//                 self.event_tx.send(ResolverEvent::DataChangedEvent).unwrap(),
-//             _ => panic!("Unexpected event type: {:?}", e.event_type)
-//         };
-//     }
-// }
-
 
 #[cfg(test)]
 mod test {
@@ -777,12 +669,6 @@ mod test {
     #[test]
     fn sand_test() {
 
-        // loop {
-        //     println!("{:?}", TcpStream::connect("10.77.77.92:2181"));
-        //     let ten_millis = Duration::from_millis(1000);
-        //     thread::sleep(ten_millis);
-        // }
-
         let conn_str = ZKConnectString::from_str(
             "10.77.77.92:2181").unwrap();
         let path = "/manatee/1.moray.virtual.example.com".to_string();
@@ -793,6 +679,7 @@ mod test {
         for _ in 0..4 {
             match rx.recv() {
                 Ok(event) => {
+                    println!("received");
                     match event {
                         BackendMsg::AddedMsg(msg) => {
                             println!("Added: {:?}", msg.backend);
@@ -809,8 +696,9 @@ mod test {
                 },
             }
         }
+        println!("stopping");
         resolver.stop();
-
+        println!("starting");
         resolver.start(tx.clone());
         loop {
             match rx.recv() {
@@ -833,133 +721,3 @@ mod test {
         }
     }
  }
-
-/*
-{ manatee:
-   { path: '/manatee/1.moray.virtual.example.com',
-     zk:
-      { connStr: '10.77.77.91:2181,10.77.77.92:2181,10.77.77.93:2181',
-        opts: [Object] },
-     log:
-      Logger {
-        domain: null,
-        _events: {},
-        _eventsCount: 0,
-        _maxListeners: undefined,
-        _level: 30,
-        streams: [Object],
-        serializers: [Object],
-        src: false,
-        fields: [Object] } },
-  pg:
-   { connectTimeout: 4000,
-     checkInterval: 90000,
-     maxConnections: 16,
-     maxIdleTime: 270000,
-     user: 'moray' } }
-
-
-
-/// Cueball backend resolver
-///
-/// `Resolver`s identify the available backends (*i.e.* nodes) providing a
-/// service and relay information about those backends to the connection
-/// pool. It should also inform the connection pool when a backend is no longer
-/// available so that the pool can rebalance the connections on the remaining
-/// backends.
-pub trait Resolver: Send + 'static {
-    /// Start the operation of the resolver. Begin querying for backends and
-    /// notifying the connection pool using the provided `Sender`.
-    fn start(&mut self, s: Sender<BackendMsg>);
-    /// Shutdown the resolver. Cease querying for new backends. In the event
-    /// that attempting to send a message on the `Sender` channel provided in
-    /// [`start`]: #method.start fails with an error then this method should be
-    /// called as it indicates the connection pool is shutting down.
-    fn stop(&mut self);
-    /// Return the last error if one has occurred.
-    fn get_last_error(&self) -> Option<String>;
-}
-
-
-/// A type representing the different information about a Cueball backend.
-#[derive(Clone, Debug)]
-pub struct Backend {
-    /// The concatenation of the backend address and port with a colon delimiter.
-    pub name: BackendName,
-    /// The address of the backend.
-    pub address: BackendAddress,
-    /// The port of the backend.
-    pub port: BackendPort,
-}
-
-impl Backend {
-    /// Return a new instance of `Backend` given a `BackendAddress` and `BackendPort`.
-    pub fn new(address: &BackendAddress, port: BackendPort) -> Self {
-        Backend {
-            name: backend_name(address, port),
-            address: *address,
-            port,
-        }
-    }
-
-/// Represents the message that should be sent to the connection pool when a new
-/// backend is found.
-pub struct BackendAddedMsg {
-    /// A backend key
-    pub key: backend::BackendKey,
-    /// A `Backend` instance
-    pub backend: backend::Backend,
-}
-
-/// Represents the message that should be sent to the backend when a backend is
-/// no longer available.
-pub struct BackendRemovedMsg(pub backend::BackendKey);
-
-/// The types of messages that may be sent to the connection pool. `StopMsg` is
-/// only for use by the connection pool when performing cleanup prior to
-/// shutting down.
-pub enum BackendMsg {
-    /// Indicates a new backend was found by the resolver
-    AddedMsg(BackendAddedMsg),
-    /// Indicates a backend is no longer available to service connections
-    RemovedMsg(BackendRemovedMsg),
-    // For internal pool use only
-    #[doc(hidden)]
-    StopMsg,
-}
-
-/// Returned from the functions used by the connection pool to add or remove
-/// backends based on the receipt of `BackedMsg`s by the pool.
-pub enum BackendAction {
-    /// Indicates a new backend was added by the connection pool.
-    BackendAdded,
-    /// Indicates an existing backend was removed by the connection pool.
-    BackendRemoved,
-}
-
-/// A base64 encoded identifier based on the backend name, address, and port.
-#[derive(Clone, Debug, Display, Eq, From, Hash, Into, Ord, PartialOrd, PartialEq)]
-pub struct BackendKey(String);
-/// The port number for a backend. This is a type alias for u16.
-pub type BackendPort = u16;
-/// The concatenation of the backend address and port with a colon
-/// delimiter. This is a type alias for String.
-pub type BackendName = String;
-/// The IP address of the backend. This is a type alias for std::net::IpAddr.
-pub type BackendAddress = IpAddr;
-
-
-
-
-
-{
-  "primary": {
-    "id": "10.77.77.95:5432:12345",
-    "ip": "10.77.77.95",
-    "pgUrl": "tcp://postgres@10.77.77.95:5432/postgres",
-    "zoneId": "15b43447-7b9e-4304-ac1a-6d03698d0e0a",
-    "backupUrl": "http://10.77.77.95:12345"
-  }
-}
-
-*/
