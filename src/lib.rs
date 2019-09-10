@@ -132,9 +132,6 @@ pub struct ManateePrimaryResolver {
     cluster_state_path: String,
     /// The communications channel with the cueball connection pool
     pool_tx: Option<Sender<BackendMsg>>,
-    /// The last error that occurred. Persists across start()/stop() of a given
-    /// ManateePrimaryResolver instance.
-    error: Arc<Mutex<Option<String>>>,
     /// The key representation of the last backend sent to the cueball
     /// connection pool. Persists across start()/stop() of a given
     /// ManateePrimaryResolver instance.
@@ -161,13 +158,12 @@ impl ManateePrimaryResolver {
     ) -> Self
     {
         // TODO change 'dean' to 'state' once you're done testing
-        let cluster_state_path = [&path, "/dea"].concat();
+        let cluster_state_path = [&path, "/dean"].concat();
 
         ManateePrimaryResolver {
             connect_string,
             cluster_state_path,
             pool_tx: None,
-            error: Arc::new(Mutex::new(None)),
             last_backend: Arc::new(Mutex::new(None)),
             runtime: Arc::new(Mutex::new(None))
         }
@@ -188,16 +184,11 @@ impl ManateePrimaryResolver {
     /// * `last_backend` - The key representation of the last backend sent to
     ///   the cueball connection pool. It will be updated by process_value() if
     ///   we send a new backend over.
-    /// * `error_arcmut` The Arc/Mutex in which the function should store the
-    ///   most recent error encountered, required to implement the
-    ///   get_last_error method. This value will be updated by set_error() if we
-    ///   encounter an error.
     fn run(
         connect_string: ZKConnectString,
         cluster_state_path: String,
         pool_tx: Sender<BackendMsg>,
         last_backend: Arc<Mutex<Option<BackendKey>>>,
-        error_arcmut: Arc<Mutex<Option<String>>>
     ) {
         // The inner event-processing loop returns this enum to the outer
         // connection managing loop to indicate whether the Resolver should
@@ -211,7 +202,7 @@ impl ManateePrimaryResolver {
 
         struct InnerLoopState {
             watcher: Box<dyn futures::stream::Stream<Item = WatchedEvent, Error = ()> + Send>,
-            event: WatchedEvent,
+            curr_event: WatchedEvent,
             delay: Duration
         }
 
@@ -227,8 +218,6 @@ impl ManateePrimaryResolver {
             loop_fn(Duration::from_secs(0), move |wait_period| {
                 let pool_tx = pool_tx.clone();
                 let last_backend = Arc::clone(&last_backend);
-                let error_arcmut = Arc::clone(&error_arcmut);
-                let error_arcmut_orelse = Arc::clone(&error_arcmut);
                 let connect_string = connect_string.clone();
                 let cluster_state_path = cluster_state_path.clone();
 
@@ -263,7 +252,7 @@ impl ManateePrimaryResolver {
                         //     reconnect or terminate.
                         loop_fn(InnerLoopState {
                             watcher: Box::new(default_watcher),
-                            event: WatchedEvent {
+                            curr_event: WatchedEvent {
                                 event_type: WatchedEventType::NodeDataChanged,
                                 // This initial artificial keeper_state doesn't
                                 // necessarily reflect reality, but that's ok
@@ -280,7 +269,7 @@ impl ManateePrimaryResolver {
                             delay: INNER_LOOP_NODELAY
                         } , move |loop_state| {
                             let watcher = loop_state.watcher;
-                            let curr_event = loop_state.event;
+                            let curr_event = loop_state.curr_event;
                             let delay = loop_state.delay;
                             let when = Instant::now() + delay;
 
@@ -288,8 +277,6 @@ impl ManateePrimaryResolver {
 
                             let pool_tx = pool_tx.clone();
                             let last_backend = Arc::clone(&last_backend);
-                            let error_arcmut = Arc::clone(&error_arcmut);
-                            let error_arcmut_orelse = Arc::clone(&error_arcmut);
                             // State: Watch unarmed
 
                             // We set the watch here. If the previous iteration
@@ -319,7 +306,6 @@ impl ManateePrimaryResolver {
                                                 KeeperState::AuthFailed |
                                                 KeeperState::Expired => {
                                                     ManateePrimaryResolver::set_error(
-                                                        Arc::clone(&error_arcmut),
                                                         &format!("Reconnect initiated; Keeper state changed to: {:?}",
                                                             curr_event.keeper_state)
                                                     );
@@ -338,11 +324,11 @@ impl ManateePrimaryResolver {
                                             // the node doesn't exist yet. We should
                                             // wait a bit and try again. We'll just
                                             // use the same event as before.
-                                            if let None = data {
+                                            if data.is_none() {
                                                 return Either::A(ok(Loop::Continue(
                                                     InnerLoopState {
-                                                        watcher: watcher,
-                                                        event: curr_event,
+                                                        watcher,
+                                                        curr_event,
                                                         delay: INNER_LOOP_DELAY
                                                     })));
                                             }
@@ -352,8 +338,8 @@ impl ManateePrimaryResolver {
                                                 Arc::clone(&last_backend)) {
                                                 Ok(_) => {},
                                                 Err(e) => {
+                                                    println!("Ein");
                                                     ManateePrimaryResolver::set_error(
-                                                        Arc::clone(&error_arcmut),
                                                         &e
                                                     );
                                                     // The error is between the client and the outward-facing channel,
@@ -377,42 +363,33 @@ impl ManateePrimaryResolver {
                                     Either::B(watcher
                                         .into_future()
                                         .and_then(move |(event, watcher)| {
-                                        // match event {
-                                        //     Some (event) => {
                                             // TODO I _believe_ it's valid to unwrap here,
                                             // because we control the watcher and thus the
                                             // stream should never close. Must verify this!
                                             ok(Loop::Continue(InnerLoopState {
-                                                watcher: watcher,
-                                                event: event.unwrap(),
+                                                watcher,
+                                                curr_event: event.unwrap(),
                                                 delay: INNER_LOOP_NODELAY
                                             }))
-                                        //     },
-                                        //     None => {
-                                        //         // State: event Stream closed.
-                                        //         // Given that we control the
-                                        //         // We try to reconnect.
-                                        //         println!("Event stream closed");
-                                        //         ManateePrimaryResolver::set_error(
-                                        //             Arc::clone(&error_arcmut),
-                                        //             &"blah"
-                                        //         );
-                                        //         ok(Loop::Break(
-                                        //             NextAction::Reconnect))
-                                        //     }
-                                        // }
                                         })
-                                        .map_err(|_| {
-                                            // TODO is this assertion correct?
-                                            panic!("This should never happen");
+                                        .or_else(move |error| {
+                                            // If we get an error from the event
+                                            // Stream, we assume that something
+                                            // went wrong with the zookeeper
+                                            // connection and attempt to
+                                            // reconnect.
+                                            // TODO log error
+                                            ok(Loop::Break(
+                                                NextAction::Reconnect(
+                                                RECONNECT_NODELAY)))
                                         }))
                                 })
                                 // If some error occurred getting the data,
                                 // we assume we should reconnect to the
                                 // zookeeper server.
                                 .or_else(move |error| {
+                                    println!("Zwei");
                                     ManateePrimaryResolver::set_error(
-                                        Arc::clone(&error_arcmut_orelse),
                                         &error
                                     );
                                     ok(Loop::Break(NextAction::Reconnect(RECONNECT_NODELAY)))
@@ -437,8 +414,8 @@ impl ManateePrimaryResolver {
                         })
                     })
                     .or_else(move |error| {
+                        println!("Drei");
                         ManateePrimaryResolver::set_error(
-                            Arc::clone(&error_arcmut_orelse),
                             &error
                         );
                         ok(Loop::Continue(RECONNECT_DELAY))
@@ -521,10 +498,10 @@ impl ManateePrimaryResolver {
 
         // Send the new backend if it differs from the old one
         if should_send {
-            if let Err(_) = pool_tx.send(BackendMsg::AddedMsg(BackendAddedMsg {
+            if pool_tx.send(BackendMsg::AddedMsg(BackendAddedMsg {
                 key: backend_key.clone(),
-                backend: backend
-            })) {
+                backend
+            })).is_err() {
                 return Err(ResolverError {
                     message: "Connection pool shutting down".to_string(),
                     should_stop: true
@@ -537,8 +514,8 @@ impl ManateePrimaryResolver {
             // Notify the connection pool that the old backend should be
             // removed, if the old backend is not None
             if let Some(lbc) = lb_clone {
-                if let Err(_) = pool_tx.send(BackendMsg::RemovedMsg(
-                    BackendRemovedMsg(lbc))) {
+                if pool_tx.send(BackendMsg::RemovedMsg(
+                    BackendRemovedMsg(lbc))).is_err() {
                     return Err(ResolverError {
                         message: "Connection pool shutting down".to_string(),
                         should_stop: true
@@ -552,11 +529,8 @@ impl ManateePrimaryResolver {
     }
 
     fn set_error<T: Debug>(
-        error_arcmut: Arc<Mutex<Option<String>>>,
         new_err: &T) {
-        let mut error = error_arcmut.lock().unwrap();
         println!("Setting error to: {:?}", new_err);
-        *error = Some(format!("{:?}", new_err));
     }
 }
 
@@ -566,7 +540,7 @@ impl Resolver for ManateePrimaryResolver {
         // If self.runtime is not None, the Resolver is running, so we can
         // return here without doing anything.
         let mut runtime = self.runtime.lock().unwrap();
-        if let Some(_) = *runtime {
+        if (*runtime).is_some() {
             return;
         }
 
@@ -574,7 +548,6 @@ impl Resolver for ManateePrimaryResolver {
         let connect_string = self.connect_string.clone();
         let cluster_state_path = self.cluster_state_path.clone();
         let last_backend = Arc::clone(&self.last_backend);
-        let error = Arc::clone(&self.error);
 
         let mut rt = Runtime::new().unwrap();
 
@@ -584,8 +557,7 @@ impl Resolver for ManateePrimaryResolver {
                 connect_string,
                 cluster_state_path,
                 s_clone,
-                last_backend,
-                error);
+                last_backend);
             Ok(())
         }));
 
@@ -598,7 +570,7 @@ impl Resolver for ManateePrimaryResolver {
         let mut runtime = self.runtime.lock().unwrap();
         // If self.runtime is None, the Resolver is stopped, so we can return
         // here without doing anyting.
-        if let None = *runtime {
+        if (*runtime).is_none() {
             return;
         }
 
@@ -622,15 +594,6 @@ impl Resolver for ManateePrimaryResolver {
         // ().
         local_runtime.unwrap().shutdown_now().wait().unwrap();
     }
-
-    // fn get_last_error(&self) -> Option<String> {
-    //     if let Some(err) = &*self.error.lock().unwrap() {
-    //             let err_str = format!("{}", err);
-    //             Some(err_str)
-    //     } else {
-    //         None
-    //     }
-    // }
 }
 
 #[cfg(test)]
