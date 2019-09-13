@@ -3,13 +3,12 @@
  */
 
 use std::convert::From;
-use std::error::Error;
 use std::fmt;
 use std::fmt::{Debug, Display};
 use std::mem;
 use std::net::{AddrParseError, SocketAddr};
 use std::str::{FromStr};
-use std::sync::mpsc::{channel, Sender};
+use std::sync::mpsc::{Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -22,7 +21,6 @@ use tokio_zookeeper::*;
 use tokio::prelude::*;
 use tokio::runtime::Runtime;
 use tokio::timer::Delay;
-use tokio::timer::Error as TimerError;
 use url::{Url, ParseError};
 
 use cueball::backend::*;
@@ -33,14 +31,12 @@ use cueball::resolver::{
     Resolver
 };
 
-const RECONNECT_DELAY: Duration = Duration::from_secs(10);
+const RECONNECT_DELAY: Duration = Duration::from_secs(00);
 const RECONNECT_NODELAY: Duration = Duration::from_secs(0);
 const INNER_LOOP_DELAY: Duration = Duration::from_secs(10);
 const INNER_LOOP_NODELAY: Duration = Duration::from_secs(10);
 
-
-// TODO make sure set_error is being called everywhere there's a client-facing
-// error
+// TODO make sure errors are being logged everywhere
 // TODO add logging
 
 // An error type to be used internally.
@@ -201,7 +197,8 @@ impl ManateePrimaryResolver {
         }
 
         struct InnerLoopState {
-            watcher: Box<dyn futures::stream::Stream<Item = WatchedEvent, Error = ()> + Send>,
+            watcher: Box<dyn futures::stream::Stream
+                <Item = WatchedEvent, Error = ()> + Send>,
             curr_event: WatchedEvent,
             delay: Duration
         }
@@ -222,7 +219,8 @@ impl ManateePrimaryResolver {
                 let cluster_state_path = cluster_state_path.clone();
 
                 let run_connect = move |_| {
-                    ZooKeeper::connect(&connect_string.to_string().parse().unwrap())
+                    ZooKeeper::connect(
+                        &connect_string.to_string().parse().unwrap())
                     .and_then(move |(zk, default_watcher)| {
                         // State: Connected
                         println!("Connected to zk client");
@@ -300,16 +298,20 @@ impl ManateePrimaryResolver {
                                     match curr_event.event_type {
                                         // Keeper state has changed
                                         WatchedEventType::None => {
-                                            println!("Keeper state changed to: {:?}", curr_event.keeper_state);
+                                            println!(
+                                                "Keeper state changed to: {:?}",
+                                                curr_event.keeper_state);
                                             match curr_event.keeper_state {
                                                 KeeperState::Disconnected |
                                                 KeeperState::AuthFailed |
                                                 KeeperState::Expired => {
                                                     ManateePrimaryResolver::set_error(
-                                                        &format!("Reconnect initiated; Keeper state changed to: {:?}",
-                                                            curr_event.keeper_state)
+                                                        &format!(
+                                                        "Reconnect initiated; Keeper state changed to: {:?}",
+                                                        curr_event.keeper_state)
                                                     );
-                                                    return Either::A(ok(Loop::Break(
+                                                    return Either::A(
+                                                        ok(Loop::Break(
                                                         NextAction::Reconnect(
                                                         RECONNECT_NODELAY))));
                                                 },
@@ -320,10 +322,11 @@ impl ManateePrimaryResolver {
                                         },
                                         // The data watch fired
                                         WatchedEventType::NodeDataChanged => {
-                                            // We didn't get the data, which means
-                                            // the node doesn't exist yet. We should
-                                            // wait a bit and try again. We'll just
-                                            // use the same event as before.
+                                            // We didn't  get the data, which
+                                            // means the node doesn't exist yet.
+                                            // We should wait a bit and try
+                                            // again. We'll just use the same
+                                            // event as before.
                                             if data.is_none() {
                                                 return Either::A(ok(Loop::Continue(
                                                     InnerLoopState {
@@ -338,21 +341,30 @@ impl ManateePrimaryResolver {
                                                 Arc::clone(&last_backend)) {
                                                 Ok(_) => {},
                                                 Err(e) => {
-                                                    println!("Ein");
                                                     ManateePrimaryResolver::set_error(
                                                         &e
                                                     );
-                                                    // The error is between the client and the outward-facing channel,
-                                                    // not between the client and the zookeeper connection, so we
-                                                    // don't have to attempt to reconnect here and can continue, unless
-                                                    // the error tells us to stop.
+                                                    // The error is between the
+                                                    // client and the
+                                                    // outward-facing channel,
+                                                    // not between the client
+                                                    // and the zookeeper
+                                                    // connection, so we don't
+                                                    // have to attempt to
+                                                    // reconnect here and can
+                                                    // continue, unless the
+                                                    // error tells us to stop.
                                                     if e.should_stop {
-                                                        return Either::A(ok(Loop::Break(NextAction::Stop)));
+                                                        return Either::A(ok(
+                                                            Loop::Break(
+                                                            NextAction::Stop)));
                                                     }
                                                 }
                                             }
                                         },
-                                        e => panic!("Unexpected event received: {:?}", e)
+                                        e => panic!(
+                                            "Unexpected event received: {:?}",
+                                            e)
                                     };
 
                                     // If we got here, we're waiting for the watch
@@ -363,22 +375,39 @@ impl ManateePrimaryResolver {
                                     Either::B(watcher
                                         .into_future()
                                         .and_then(move |(event, watcher)| {
-                                            // TODO I _believe_ it's valid to unwrap here,
-                                            // because we control the watcher and thus the
-                                            // stream should never close. Must verify this!
-                                            ok(Loop::Continue(InnerLoopState {
-                                                watcher,
-                                                curr_event: event.unwrap(),
-                                                delay: INNER_LOOP_NODELAY
-                                            }))
+                                            let loop_next = match event {
+                                                Some(e) => {
+                                                    Loop::Continue(InnerLoopState {
+                                                        watcher,
+                                                        curr_event: e,
+                                                        delay: INNER_LOOP_NODELAY
+                                                    })
+                                                },
+                                                // If we didn't get a valid
+                                                // event, this means the Stream
+                                                // got closed, which indicates
+                                                // a connection issue -- so we
+                                                // reconnect.
+                                                None => {
+                                                    Loop::Break(
+                                                        NextAction::Reconnect(
+                                                        RECONNECT_NODELAY))
+                                                }
+                                            };
+                                            ok(loop_next)
                                         })
-                                        .or_else(move |error| {
+                                        .or_else(move |_error| {
                                             // If we get an error from the event
                                             // Stream, we assume that something
                                             // went wrong with the zookeeper
                                             // connection and attempt to
                                             // reconnect.
-                                            // TODO log error
+                                            // TODO the type of 'error' is weird
+                                            // which is why I threw in a
+                                            // placeholder
+                                            ManateePrimaryResolver::set_error(
+                                                &"placeholder"
+                                            );
                                             ok(Loop::Break(
                                                 NextAction::Reconnect(
                                                 RECONNECT_NODELAY)))
@@ -388,11 +417,11 @@ impl ManateePrimaryResolver {
                                 // we assume we should reconnect to the
                                 // zookeeper server.
                                 .or_else(move |error| {
-                                    println!("Zwei");
                                     ManateePrimaryResolver::set_error(
                                         &error
                                     );
-                                    ok(Loop::Break(NextAction::Reconnect(RECONNECT_NODELAY)))
+                                    ok(Loop::Break(NextAction::Reconnect(
+                                        RECONNECT_NODELAY)))
                                 })
                             })
                             .map_err(|e| panic!("delay errored; err: {:?}", e))
@@ -414,7 +443,6 @@ impl ManateePrimaryResolver {
                         })
                     })
                     .or_else(move |error| {
-                        println!("Drei");
                         ManateePrimaryResolver::set_error(
                             &error
                         );
@@ -528,6 +556,8 @@ impl ManateePrimaryResolver {
         Ok(())
     }
 
+    // TODO this is a holdover from when get_last_error existed -- replace calls
+    // to this with logging instead
     fn set_error<T: Debug>(
         new_err: &T) {
         println!("Setting error to: {:?}", new_err);
@@ -601,6 +631,7 @@ mod test {
     use super::*;
 
     use std::iter;
+    use std::sync::mpsc::channel;
 
     use quickcheck::{quickcheck, Arbitrary, Gen};
 
@@ -630,7 +661,7 @@ mod test {
     }
 
     #[test]
-    fn sand_test() {
+    fn sandbox_test() {
 
         let conn_str = ZKConnectString::from_str(
             "10.77.77.92:2181").unwrap();
@@ -650,7 +681,8 @@ mod test {
                         BackendMsg::RemovedMsg(msg) => {
                             println!("Removed: {:?}", msg.0);
                         },
-                        BackendMsg::StopMsg => panic!("Stop message received; how???")
+                        BackendMsg::StopMsg =>
+                            panic!("Stop message received; how???")
                     }
                 }
                 Err(e) => {
@@ -673,7 +705,8 @@ mod test {
                         BackendMsg::RemovedMsg(msg) => {
                             println!("Removed: {:?}", msg.0);
                         },
-                        BackendMsg::StopMsg => panic!("Stop message received; how???")
+                        BackendMsg::StopMsg =>
+                            panic!("Stop message received; how???")
                     }
                 }
                 Err(e) => {
