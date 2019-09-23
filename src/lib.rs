@@ -162,8 +162,7 @@ impl ManateePrimaryResolver {
         path: String
     ) -> Self
     {
-        // TODO change 'dean' to 'state' once you're done testing
-        let cluster_state_path = [&path, "/dean"].concat();
+        let cluster_state_path = [&path, "/state"].concat();
 
         ManateePrimaryResolver {
             connect_string: connect_string.clone(),
