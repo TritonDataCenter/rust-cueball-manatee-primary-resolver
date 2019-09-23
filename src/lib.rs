@@ -12,11 +12,15 @@ use std::sync::mpsc::{Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use itertools::Itertools;
+use clap::{crate_name, crate_version};
 use futures::future::{ok, loop_fn, Either, Future, Loop, lazy};
+use itertools::Itertools;
 use serde_json;
-use serde_json::Value;
+use serde_json::Value as SerdeJsonValue;
 use serde_json::error::Error as SerdeJsonError;
+use slog::{error, info, debug, o, Drain, Key, LevelFilter, Logger, Record, Serializer};
+use slog::Result as SlogResult;
+use slog::Value as SlogValue;
 use tokio_zookeeper::*;
 use tokio::prelude::*;
 use tokio::runtime::Runtime;
@@ -31,13 +35,10 @@ use cueball::resolver::{
     Resolver
 };
 
-const RECONNECT_DELAY: Duration = Duration::from_secs(00);
+const RECONNECT_DELAY: Duration = Duration::from_secs(10);
 const RECONNECT_NODELAY: Duration = Duration::from_secs(0);
 const INNER_LOOP_DELAY: Duration = Duration::from_secs(10);
-const INNER_LOOP_NODELAY: Duration = Duration::from_secs(10);
-
-// TODO make sure errors are being logged everywhere
-// TODO add logging
+const INNER_LOOP_NODELAY: Duration = Duration::from_secs(0);
 
 // An error type to be used internally.
 // The "should_stop" field indicates whether the Resolver should stop() in
@@ -119,6 +120,14 @@ impl FromStr for ZKConnectString {
     }
 }
 
+struct LogItem<T>(T) where T: Debug;
+impl<T: Debug> SlogValue for LogItem<T> {
+    fn serialize(&self, _rec: &Record, key: Key, serializer: &mut dyn Serializer)
+        -> SlogResult {
+            serializer.emit_str(key, &format!("{:?}", self.0))
+    }
+}
+
 #[derive(Debug)]
 pub struct ManateePrimaryResolver {
     /// The addresses of the Zookeeper cluster the Resolver is connecting to
@@ -126,8 +135,6 @@ pub struct ManateePrimaryResolver {
     /// The Zookeeper path for manatee cluster state for the shard. *e.g.*
     /// "/manatee/1.moray.coal.joyent.us/state"
     cluster_state_path: String,
-    /// The communications channel with the cueball connection pool
-    pool_tx: Option<Sender<BackendMsg>>,
     /// The key representation of the last backend sent to the cueball
     /// connection pool. Persists across start()/stop() of a given
     /// ManateePrimaryResolver instance.
@@ -137,6 +144,8 @@ pub struct ManateePrimaryResolver {
     /// The following invariant is maintained: If `runtime` is not None, the
     /// Resolver is running. if `runtime` is None, the resolver is stopped.
     runtime: Arc<Mutex<Option<Runtime>>>,
+    /// The ManateePrimaryResolver's root log
+    log: Logger
 }
 
 impl ManateePrimaryResolver {
@@ -157,11 +166,22 @@ impl ManateePrimaryResolver {
         let cluster_state_path = [&path, "/dean"].concat();
 
         ManateePrimaryResolver {
-            connect_string,
-            cluster_state_path,
-            pool_tx: None,
+            connect_string: connect_string.clone(),
+            cluster_state_path: cluster_state_path.clone(),
             last_backend: Arc::new(Mutex::new(None)),
-            runtime: Arc::new(Mutex::new(None))
+            runtime: Arc::new(Mutex::new(None)),
+            log: Logger::root(
+                Mutex::new(LevelFilter::new(
+                    slog_bunyan::with_name(crate_name!(), std::io::stdout()).build(),
+                    // config.log.level.into(),
+                    // TODO replace with user-configurable (somehow) log level
+                    slog::Level::Trace,
+                ))
+                .fuse(),
+                o!("build-id" => crate_version!(),
+                    "connect_string" => LogItem(connect_string.to_string()),
+                    "path" => cluster_state_path),
+            )
         }
     }
 
@@ -185,6 +205,7 @@ impl ManateePrimaryResolver {
         cluster_state_path: String,
         pool_tx: Sender<BackendMsg>,
         last_backend: Arc<Mutex<Option<BackendKey>>>,
+        log: Logger,
     ) {
         // The inner event-processing loop returns this enum to the outer
         // connection managing loop to indicate whether the Resolver should
@@ -203,6 +224,7 @@ impl ManateePrimaryResolver {
             delay: Duration
         }
 
+        info!(log, "run(): spawning background event-handling task");
         tokio::spawn(lazy(move ||{
             // Outer loop. Handles connecting to zookeeper. A new loop iteration
             // means a new zookeeper connection. Breaking from the loop means
@@ -212,18 +234,21 @@ impl ManateePrimaryResolver {
             //     Repeated iterations of the loop set a delay before
             //     connecting.
             // Loop::Break type: ()
+            let at_log = log.clone();
             loop_fn(Duration::from_secs(0), move |wait_period| {
                 let pool_tx = pool_tx.clone();
                 let last_backend = Arc::clone(&last_backend);
                 let connect_string = connect_string.clone();
                 let cluster_state_path = cluster_state_path.clone();
-
+                let log = log.clone();
+                let oe_log = log.clone();
                 let run_connect = move |_| {
+                    info!(log, "Connecting to ZooKeeper cluster");
                     ZooKeeper::connect(
                         &connect_string.to_string().parse().unwrap())
                     .and_then(move |(zk, default_watcher)| {
                         // State: Connected
-                        println!("Connected to zk client");
+                        info!(log, "Connected to ZooKeeper cluster");
 
                         // Main change-watching loop. A new loop iteration means
                         // we're setting a new watch (if necessary) and waiting
@@ -270,11 +295,19 @@ impl ManateePrimaryResolver {
                             let curr_event = loop_state.curr_event;
                             let delay = loop_state.delay;
                             let when = Instant::now() + delay;
-
-                            println!("Getting data; watching for changes");
-
                             let pool_tx = pool_tx.clone();
                             let last_backend = Arc::clone(&last_backend);
+                            let cluster_state_path = cluster_state_path.clone();
+                            let zk = zk.clone();
+                            // TODO avoid mutex boilerplate from showing up in the log
+                            let log = log.new(o!(
+                                "curr_event" => LogItem(curr_event.clone()),
+                                "delay" => LogItem(delay.clone()),
+                                "last_backend" => LogItem(Arc::clone(&last_backend))
+                            ));
+
+                            info!(log, "Getting data");
+                            let oe_log = log.clone();
                             // State: Watch unarmed
 
                             // We set the watch here. If the previous iteration
@@ -287,8 +320,6 @@ impl ManateePrimaryResolver {
                             // to optimize for this case, since keeper state
                             // changes (and, indeed, changes of any sort) should
                             // happen infrequently.
-                            let cluster_state_path = cluster_state_path.clone();
-                            let zk = zk.clone();
                             Delay::new(when)
                             .and_then(move |_| {
                                 zk
@@ -298,18 +329,17 @@ impl ManateePrimaryResolver {
                                     match curr_event.event_type {
                                         // Keeper state has changed
                                         WatchedEventType::None => {
-                                            println!(
-                                                "Keeper state changed to: {:?}",
-                                                curr_event.keeper_state);
                                             match curr_event.keeper_state {
+                                                // TODO will these cases ever happen?
+                                                // because if the keeper state is "bad",
+                                                // then the get_data will have failed
+                                                // and we won't be here.
                                                 KeeperState::Disconnected |
                                                 KeeperState::AuthFailed |
                                                 KeeperState::Expired => {
-                                                    ManateePrimaryResolver::set_error(
-                                                        &format!(
-                                                        "Reconnect initiated; Keeper state changed to: {:?}",
-                                                        curr_event.keeper_state)
-                                                    );
+                                                    error!(log, "Keeper state changed; reconnecting";
+                                                        "keeper_state" =>
+                                                        LogItem(curr_event.keeper_state));
                                                     return Either::A(
                                                         ok(Loop::Break(
                                                         NextAction::Reconnect(
@@ -317,7 +347,11 @@ impl ManateePrimaryResolver {
                                                 },
                                                 KeeperState::SyncConnected |
                                                 KeeperState::ConnectedReadOnly |
-                                                KeeperState::SaslAuthenticated => {}
+                                                KeeperState::SaslAuthenticated => {
+                                                    info!(log, "Keeper state changed";
+                                                        "keeper_state" =>
+                                                        LogItem(curr_event.keeper_state));
+                                                }
                                             }
                                         },
                                         // The data watch fired
@@ -328,6 +362,8 @@ impl ManateePrimaryResolver {
                                             // again. We'll just use the same
                                             // event as before.
                                             if data.is_none() {
+                                                info!(log, "ZK data does not \
+                                                    exist yet");
                                                 return Either::A(ok(Loop::Continue(
                                                     InnerLoopState {
                                                         watcher,
@@ -335,15 +371,16 @@ impl ManateePrimaryResolver {
                                                         delay: INNER_LOOP_DELAY
                                                     })));
                                             }
+                                            info!(log, "got data"; "data" =>
+                                                LogItem(data.clone()));
                                             match ManateePrimaryResolver::process_value(
                                                 &pool_tx.clone(),
                                                 &data.unwrap(),
-                                                Arc::clone(&last_backend)) {
+                                                Arc::clone(&last_backend),
+                                                log.clone()) {
                                                 Ok(_) => {},
                                                 Err(e) => {
-                                                    ManateePrimaryResolver::set_error(
-                                                        &e
-                                                    );
+                                                    error!(log, ""; "error" => LogItem(e.clone()));
                                                     // The error is between the
                                                     // client and the
                                                     // outward-facing channel,
@@ -371,12 +408,16 @@ impl ManateePrimaryResolver {
                                     // to fire. Before this point, we wrap the
                                     // return value in Either::A. After this point,
                                     // we wrap the return value in Either::B.
-
+                                    info!(log, "Watching for change");
+                                    let oe_log = log.clone();
                                     Either::B(watcher
                                         .into_future()
                                         .and_then(move |(event, watcher)| {
                                             let loop_next = match event {
                                                 Some(e) => {
+                                                    info!(log, "change event received; \
+                                                        looping to process event";
+                                                        "event" => LogItem(e.clone()));
                                                     Loop::Continue(InnerLoopState {
                                                         watcher,
                                                         curr_event: e,
@@ -389,6 +430,8 @@ impl ManateePrimaryResolver {
                                                 // a connection issue -- so we
                                                 // reconnect.
                                                 None => {
+                                                    error!(log, "Event stream closed; \
+                                                        reconnecting");
                                                     Loop::Break(
                                                         NextAction::Reconnect(
                                                         RECONNECT_NODELAY))
@@ -396,18 +439,17 @@ impl ManateePrimaryResolver {
                                             };
                                             ok(loop_next)
                                         })
-                                        .or_else(move |_error| {
+                                        .or_else(move |_| {
                                             // If we get an error from the event
                                             // Stream, we assume that something
                                             // went wrong with the zookeeper
                                             // connection and attempt to
                                             // reconnect.
-                                            // TODO the type of 'error' is weird
-                                            // which is why I threw in a
-                                            // placeholder
-                                            ManateePrimaryResolver::set_error(
-                                                &"placeholder"
-                                            );
+                                            //
+                                            // The stream's error type is (), so
+                                            // there's no information to extract
+                                            // from it.
+                                            error!(oe_log, "Error received from event stream");
                                             ok(Loop::Break(
                                                 NextAction::Reconnect(
                                                 RECONNECT_NODELAY)))
@@ -417,9 +459,8 @@ impl ManateePrimaryResolver {
                                 // we assume we should reconnect to the
                                 // zookeeper server.
                                 .or_else(move |error| {
-                                    ManateePrimaryResolver::set_error(
-                                        &error
-                                    );
+                                    error!(oe_log, "Error getting data";
+                                        "error" => LogItem(error));
                                     ok(Loop::Break(NextAction::Reconnect(
                                         RECONNECT_NODELAY)))
                                 })
@@ -443,9 +484,8 @@ impl ManateePrimaryResolver {
                         })
                     })
                     .or_else(move |error| {
-                        ManateePrimaryResolver::set_error(
-                            &error
-                        );
+                        error!(oe_log, "Error connecting to ZooKeeper cluster";
+                            "error" => LogItem(error));
                         ok(Loop::Continue(RECONNECT_DELAY))
                     })
                 };
@@ -454,8 +494,8 @@ impl ManateePrimaryResolver {
                 Delay::new(when)
                 .and_then(run_connect)
                 .map_err(|e| panic!("delay errored; err: {:?}", e))
-            }).and_then(|_| {
-                println!("stopping!");
+            }).and_then(move |_| {
+                info!(at_log, "Event-processing task stopping");
                 Ok(())
             })
             .map(|_| ())
@@ -474,14 +514,17 @@ impl ManateePrimaryResolver {
     fn process_value(
         pool_tx: &Sender<BackendMsg>,
         new_value: &(Vec<u8>, Stat),
-        last_backend: Arc<Mutex<Option<BackendKey>>>
+        last_backend: Arc<Mutex<Option<BackendKey>>>,
+        log: Logger
     ) -> Result<(), ResolverError> {
-        let v: Value = serde_json::from_slice(&new_value.0)?;
+        debug!(log, "process_value() entered");
+
+        let v: SerdeJsonValue = serde_json::from_slice(&new_value.0)?;
 
         // Parse out the ip. We expect the json fields to exist, and return an
         // error if they don't.
         let ip = match &v["primary"]["ip"] {
-            Value::String(s) => BackendAddress::from_str(s)?,
+            SerdeJsonValue::String(s) => BackendAddress::from_str(s)?,
             _ => {
                 return Err(ResolverError {
                     message: "Malformed zookeeper primary data received for \
@@ -494,7 +537,7 @@ impl ManateePrimaryResolver {
         // Parse out the port. We expect the json fields to exist, and return an
         // error if they don't.
         let port = match &v["primary"]["pgUrl"] {
-            Value::String(s) => {
+            SerdeJsonValue::String(s) => {
                 match Url::parse(s)?.port() {
                     Some(port) => port,
                     None => {
@@ -526,6 +569,8 @@ impl ManateePrimaryResolver {
 
         // Send the new backend if it differs from the old one
         if should_send {
+            info!(log, "New backend found; sending to connection pool";
+                "backend" => LogItem(backend.clone()));
             if pool_tx.send(BackendMsg::AddedMsg(BackendAddedMsg {
                 key: backend_key.clone(),
                 backend
@@ -542,6 +587,7 @@ impl ManateePrimaryResolver {
             // Notify the connection pool that the old backend should be
             // removed, if the old backend is not None
             if let Some(lbc) = lb_clone {
+                info!(log, "Notifying connection pool of removal of old backend");
                 if pool_tx.send(BackendMsg::RemovedMsg(
                     BackendRemovedMsg(lbc))).is_err() {
                     return Err(ResolverError {
@@ -551,56 +597,60 @@ impl ManateePrimaryResolver {
                 }
             }
         } else {
-            println!("Value is same; not sending");
+            info!(log, "New backend value does not differ; not sending");
         }
+        debug!(log, "process_value() returned successfully");
         Ok(())
-    }
-
-    // TODO this is a holdover from when get_last_error existed -- replace calls
-    // to this with logging instead
-    fn set_error<T: Debug>(
-        new_err: &T) {
-        println!("Setting error to: {:?}", new_err);
     }
 }
 
 impl Resolver for ManateePrimaryResolver {
 
     fn start(&mut self, s: Sender<BackendMsg>) {
+        debug!(self.log, "start() method entered");
+
         // If self.runtime is not None, the Resolver is running, so we can
         // return here without doing anything.
         let mut runtime = self.runtime.lock().unwrap();
         if (*runtime).is_some() {
+            info!(self.log,
+                "Resolver already running; start() method doing nothing");
             return;
         }
 
-        let s_clone = s.clone();
+        let s = s.clone();
         let connect_string = self.connect_string.clone();
         let cluster_state_path = self.cluster_state_path.clone();
         let last_backend = Arc::clone(&self.last_backend);
+        let task_log = self.log.clone();
 
         let mut rt = Runtime::new().unwrap();
 
+        info!(self.log, "start(): starting runtime");
         // Start the background event-processing task
         rt.spawn(lazy(|| {
             ManateePrimaryResolver::run(
                 connect_string,
                 cluster_state_path,
-                s_clone,
-                last_backend);
+                s,
+                last_backend,
+                task_log);
             Ok(())
         }));
 
         // Save the required persistent state
-        self.pool_tx = Some(s);
-        *runtime = Some(rt)
+        *runtime = Some(rt);
+        debug!(self.log, "start() returned successfully");
     }
 
     fn stop(&mut self) {
+        debug!(self.log, "stop() method entered");
         let mut runtime = self.runtime.lock().unwrap();
         // If self.runtime is None, the Resolver is stopped, so we can return
         // here without doing anyting.
         if (*runtime).is_none() {
+            info!(self.log,
+                "Resolver not running; stop() method doing nothing");
             return;
         }
 
@@ -622,7 +672,9 @@ impl Resolver for ManateePrimaryResolver {
         // We can also unwrap shutdown_now().wait(), because, as I understand
         // it, shutdown_now cannot return an error. Indeed, the error type is
         // ().
+        info!(self.log, "Stopping runtime");
         local_runtime.unwrap().shutdown_now().wait().unwrap();
+        debug!(self.log, "stop() returned successfully");
     }
 }
 
@@ -673,7 +725,6 @@ mod test {
         for _ in 0..4 {
             match rx.recv() {
                 Ok(event) => {
-                    println!("received");
                     match event {
                         BackendMsg::AddedMsg(msg) => {
                             println!("Added: {:?}", msg.backend);
