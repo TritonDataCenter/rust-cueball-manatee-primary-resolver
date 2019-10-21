@@ -5,15 +5,15 @@
 use std::convert::From;
 use std::fmt;
 use std::fmt::{Debug, Display};
-use std::mem;
 use std::net::{AddrParseError, SocketAddr};
 use std::str::{FromStr};
 use std::sync::mpsc::{Sender};
 use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use clap::{crate_name, crate_version};
-use futures::future::{ok, loop_fn, Either, Future, Loop, lazy};
+use futures::future::{ok, loop_fn, Either, Future, Loop};
 use itertools::Itertools;
 use serde_json;
 use serde_json::Value as SerdeJsonValue;
@@ -35,13 +35,15 @@ use cueball::resolver::{
     Resolver
 };
 
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+
 const RECONNECT_DELAY: Duration = Duration::from_secs(10);
 const RECONNECT_NODELAY: Duration = Duration::from_secs(0);
 const INNER_LOOP_DELAY: Duration = Duration::from_secs(10);
 const INNER_LOOP_NODELAY: Duration = Duration::from_secs(0);
 
 // An error type to be used internally.
-// The "should_stop" field indicates whether the Resolver should stop() in
+// The "should_stop" field indicates whether the Resolver should stop in
 // response to the error -- if false, it will instead continue watching for
 // cluster state changes.
 #[derive(Debug, Clone)]
@@ -122,8 +124,8 @@ impl FromStr for ZKConnectString {
 
 struct LogItem<T>(T) where T: Debug;
 impl<T: Debug> SlogValue for LogItem<T> {
-    fn serialize(&self, _rec: &Record, key: Key, serializer: &mut dyn Serializer)
-        -> SlogResult {
+    fn serialize(&self, _rec: &Record, key: Key,
+        serializer: &mut dyn Serializer) -> SlogResult {
             serializer.emit_str(key, &format!("{:?}", self.0))
     }
 }
@@ -136,14 +138,10 @@ pub struct ManateePrimaryResolver {
     /// "/manatee/1.moray.coal.joyent.us/state"
     cluster_state_path: String,
     /// The key representation of the last backend sent to the cueball
-    /// connection pool. Persists across start()/stop() of a given
-    /// ManateePrimaryResolver instance.
+    /// connection pool. Persists across multiple calls to run().
     last_backend: Arc<Mutex<Option<BackendKey>>>,
-    /// The tokio Runtime struct that powers the Resolver. We save a handle so
-    /// we can kill the background tasks when calling stop().
-    /// The following invariant is maintained: If `runtime` is not None, the
-    /// Resolver is running. if `runtime` is None, the resolver is stopped.
-    runtime: Arc<Mutex<Option<Runtime>>>,
+    /// Indicates whether or not the resolver is running
+    is_running: bool,
     /// The ManateePrimaryResolver's root log
     log: Logger
 }
@@ -162,16 +160,17 @@ impl ManateePrimaryResolver {
         path: String
     ) -> Self
     {
-        let cluster_state_path = [&path, "/state"].concat();
+        let cluster_state_path = [&path, "/dean"].concat();
 
         ManateePrimaryResolver {
             connect_string: connect_string.clone(),
             cluster_state_path: cluster_state_path.clone(),
             last_backend: Arc::new(Mutex::new(None)),
-            runtime: Arc::new(Mutex::new(None)),
+            is_running: false,
             log: Logger::root(
                 Mutex::new(LevelFilter::new(
-                    slog_bunyan::with_name(crate_name!(), std::io::stdout()).build(),
+                    slog_bunyan::with_name(crate_name!(),
+                        std::io::stdout()).build(),
                     // config.log.level.into(),
                     // TODO replace with user-configurable (somehow) log level
                     slog::Level::Trace,
@@ -184,31 +183,117 @@ impl ManateePrimaryResolver {
         }
     }
 
-    /// Sets the appropriate zookeeper watches and waits for changes to occur in
-    /// a loop. For internal use; called by the start() method in a background
-    /// thread.
+    /// Parses the given zookeeper node data into a Backend object, compares it
+    /// to the last Backend sent to the cueball connection pool, and sends it
+    /// to the connection pool if the values differ.
     ///
     /// # Arguments
     ///
-    /// * `connect_string` - A comma-separated list of the zookeeper instances
-    ///   in the cluster
-    /// * `path` - The path to the cluster state node in zookeeper for the shard
-    ///   we're watching
-    /// * `pool_tx` - The Sender that this function should use to communicate
-    ///   with the cueball connection pool
-    /// * `last_backend` - The key representation of the last backend sent to
-    ///   the cueball connection pool. It will be updated by process_value() if
-    ///   we send a new backend over.
-    fn run(
-        connect_string: ZKConnectString,
-        cluster_state_path: String,
-        pool_tx: Sender<BackendMsg>,
+    /// * `pool_tx` - The Sender upon which to send the update message
+    /// * `new_value` - The raw zookeeper data we've newly retrieved
+    /// * `last_backend` - The last Backend we sent to the connection pool
+    fn process_value(
+        pool_tx: &Sender<BackendMsg>,
+        new_value: &(Vec<u8>, Stat),
         last_backend: Arc<Mutex<Option<BackendKey>>>,
-        log: Logger,
-    ) {
-        // The inner event-processing loop returns this enum to the outer
-        // connection managing loop to indicate whether the Resolver should
-        // reconnect or stop.
+        log: Logger
+    ) -> Result<(), ResolverError> {
+        debug!(log, "process_value() entered");
+
+        let v: SerdeJsonValue = serde_json::from_slice(&new_value.0)?;
+
+        // Parse out the ip. We expect the json fields to exist, and return an
+        // error if they don't.
+        let ip = match &v["primary"]["ip"] {
+            SerdeJsonValue::String(s) => BackendAddress::from_str(s)?,
+            _ => {
+                return Err(ResolverError {
+                    message: "Malformed zookeeper primary data received for \
+                        \"ip\" field".to_string(),
+                    should_stop: false
+                });
+            }
+        };
+
+        // Parse out the port. We expect the json fields to exist, and return an
+        // error if they don't.
+        let port = match &v["primary"]["pgUrl"] {
+            SerdeJsonValue::String(s) => {
+                match Url::parse(s)?.port() {
+                    Some(port) => port,
+                    None => {
+                        return Err(ResolverError {
+                            message: "primary's postgres URL contains no port"
+                                .to_string(),
+                            should_stop: false
+                        })
+                    }
+                }
+            },
+            _ => {
+                return Err(ResolverError {
+                    message: "Malformed zookeeper primary data received for \
+                        \"pgUrl\" field".to_string(),
+                    should_stop: false
+                })
+            }
+        };
+
+        let backend = Backend::new(&ip, port);
+        let backend_key = srv_key(&backend);
+        let mut last_backend = last_backend.lock().unwrap();
+
+        let should_send = match (*last_backend).clone() {
+            Some(lb) => lb != backend_key,
+            None => true,
+        };
+
+        // Send the new backend if it differs from the old one
+        if should_send {
+            info!(log, "New backend found; sending to connection pool";
+                "backend" => LogItem(backend.clone()));
+            if pool_tx.send(BackendMsg::AddedMsg(BackendAddedMsg {
+                key: backend_key.clone(),
+                backend
+            })).is_err() {
+                return Err(ResolverError {
+                    message: "Connection pool shutting down".to_string(),
+                    should_stop: true
+                });
+            }
+
+            let lb_clone = (*last_backend).clone();
+            *last_backend = Some(backend_key);
+
+            // Notify the connection pool that the old backend should be
+            // removed, if the old backend is not None
+            if let Some(lbc) = lb_clone {
+                info!(log,
+                    "Notifying connection pool of removal of old backend");
+                if pool_tx.send(BackendMsg::RemovedMsg(
+                    BackendRemovedMsg(lbc))).is_err() {
+                    return Err(ResolverError {
+                        message: "Connection pool shutting down".to_string(),
+                        should_stop: true
+                    });
+                }
+            }
+        } else {
+            info!(log, "New backend value does not differ; not sending");
+        }
+        debug!(log, "process_value() returned successfully");
+        Ok(())
+    }
+}
+
+impl Resolver for ManateePrimaryResolver {
+
+    // The resolver object is not Sync, so we can assume that only one instance
+    // of this function is running at once, because callers will have to control
+    // concurrent access.
+    fn run(&mut self, s: Sender<BackendMsg>) {
+
+        // Represents the action to be taken in the event of a connection error.
         enum NextAction {
             // The Duration field is the amount of time to wait before
             // reconnecting.
@@ -216,6 +301,8 @@ impl ManateePrimaryResolver {
             Stop,
         }
 
+        // Encapsulates the state that one iteration of the watch loop passes
+        // to the next iteration.
         struct InnerLoopState {
             watcher: Box<dyn futures::stream::Stream
                 <Item = WatchedEvent, Error = ()> + Send>,
@@ -223,8 +310,38 @@ impl ManateePrimaryResolver {
             delay: Duration
         }
 
-        info!(log, "run(): spawning background event-handling task");
-        tokio::spawn(lazy(move ||{
+        debug!(self.log, "run() method entered");
+        if self.is_running {
+            info!(self.log,
+                "Resolver already running; run() method doing nothing");
+            return;
+        }
+        let mut rt = Runtime::new().unwrap();
+        self.is_running = true;
+
+        // Variables moved to tokio runtime thread:
+        //
+        // * `connect_string` - A comma-separated list of the zookeeper
+        //   instances in the cluster
+        // * `cluster_state_path` - The path to the cluster state node in
+        //   zookeeper for the shard we're watching
+        // * `pool_tx` - The Sender that this function should use to communicate
+        //   with the cueball connection pool
+        // * `last_backend` - The key representation of the last backend sent to
+        //   the cueball connection pool. It will be updated by process_value()
+        //   if we send a new backend over.
+        // * log - A clone of the resolver's master log
+        // * at_log - Another clone, used in the `and_then` portion of the loop
+        let connect_string = self.connect_string.clone();
+        let cluster_state_path = self.cluster_state_path.clone();
+        let pool_tx = s.clone();
+        let last_backend = Arc::clone(&self.last_backend);
+        let log = self.log.clone();
+        let at_log = self.log.clone();
+
+        // Start the event-processing task
+        info!(self.log, "run(): starting runtime");
+        rt.spawn(
             // Outer loop. Handles connecting to zookeeper. A new loop iteration
             // means a new zookeeper connection. Breaking from the loop means
             // that the client is stopping.
@@ -233,7 +350,6 @@ impl ManateePrimaryResolver {
             //     Repeated iterations of the loop set a delay before
             //     connecting.
             // Loop::Break type: ()
-            let at_log = log.clone();
             loop_fn(Duration::from_secs(0), move |wait_period| {
                 let pool_tx = pool_tx.clone();
                 let last_backend = Arc::clone(&last_backend);
@@ -398,6 +514,8 @@ impl ManateePrimaryResolver {
                                                 }
                                             }
                                         },
+                                        // TODO handle NodeDeleted instead of
+                                        // panicking
                                         e => panic!(
                                             "Unexpected event received: {:?}",
                                             e)
@@ -498,182 +616,19 @@ impl ManateePrimaryResolver {
                 Ok(())
             })
             .map(|_| ())
-        }));
-    }
-
-    /// Parses the given zookeeper node data into a Backend object, compares it
-    /// to the last Backend sent to the cueball connection pool, and sends it
-    /// to the connection pool if the values differ.
-    ///
-    /// # Arguments
-    ///
-    /// * `pool_tx` - The Sender upon which to send the update message
-    /// * `new_value` - The raw zookeeper data we've newly retrieved
-    /// * `last_backend` - The last Backend we sent to the connection pool
-    fn process_value(
-        pool_tx: &Sender<BackendMsg>,
-        new_value: &(Vec<u8>, Stat),
-        last_backend: Arc<Mutex<Option<BackendKey>>>,
-        log: Logger
-    ) -> Result<(), ResolverError> {
-        debug!(log, "process_value() entered");
-
-        let v: SerdeJsonValue = serde_json::from_slice(&new_value.0)?;
-
-        // Parse out the ip. We expect the json fields to exist, and return an
-        // error if they don't.
-        let ip = match &v["primary"]["ip"] {
-            SerdeJsonValue::String(s) => BackendAddress::from_str(s)?,
-            _ => {
-                return Err(ResolverError {
-                    message: "Malformed zookeeper primary data received for \
-                        \"ip\" field".to_string(),
-                    should_stop: false
-                });
+        );
+        loop {
+            if s.send(BackendMsg::HeartbeatMsg).is_err() {
+                info!(self.log, "Connection pool channel closed");
+                break;
             }
-        };
-
-        // Parse out the port. We expect the json fields to exist, and return an
-        // error if they don't.
-        let port = match &v["primary"]["pgUrl"] {
-            SerdeJsonValue::String(s) => {
-                match Url::parse(s)?.port() {
-                    Some(port) => port,
-                    None => {
-                        return Err(ResolverError {
-                            message: "primary's postgres URL contains no port"
-                                .to_string(),
-                            should_stop: false
-                        })
-                    }
-                }
-            },
-            _ => {
-                return Err(ResolverError {
-                    message: "Malformed zookeeper primary data received for \
-                        \"pgUrl\" field".to_string(),
-                    should_stop: false
-                })
-            }
-        };
-
-        let backend = Backend::new(&ip, port);
-        let backend_key = srv_key(&backend);
-        let mut last_backend = last_backend.lock().unwrap();
-
-        let should_send = match (*last_backend).clone() {
-            Some(lb) => lb != backend_key,
-            None => true,
-        };
-
-        // Send the new backend if it differs from the old one
-        if should_send {
-            info!(log, "New backend found; sending to connection pool";
-                "backend" => LogItem(backend.clone()));
-            if pool_tx.send(BackendMsg::AddedMsg(BackendAddedMsg {
-                key: backend_key.clone(),
-                backend
-            })).is_err() {
-                return Err(ResolverError {
-                    message: "Connection pool shutting down".to_string(),
-                    should_stop: true
-                });
-            }
-
-            let lb_clone = (*last_backend).clone();
-            *last_backend = Some(backend_key);
-
-            // Notify the connection pool that the old backend should be
-            // removed, if the old backend is not None
-            if let Some(lbc) = lb_clone {
-                info!(log, "Notifying connection pool of removal of old backend");
-                if pool_tx.send(BackendMsg::RemovedMsg(
-                    BackendRemovedMsg(lbc))).is_err() {
-                    return Err(ResolverError {
-                        message: "Connection pool shutting down".to_string(),
-                        should_stop: true
-                    });
-                }
-            }
-        } else {
-            info!(log, "New backend value does not differ; not sending");
+            thread::sleep(HEARTBEAT_INTERVAL);
         }
-        debug!(log, "process_value() returned successfully");
-        Ok(())
-    }
-}
-
-impl Resolver for ManateePrimaryResolver {
-
-    fn start(&mut self, s: Sender<BackendMsg>) {
-        debug!(self.log, "start() method entered");
-
-        // If self.runtime is not None, the Resolver is running, so we can
-        // return here without doing anything.
-        let mut runtime = self.runtime.lock().unwrap();
-        if (*runtime).is_some() {
-            info!(self.log,
-                "Resolver already running; start() method doing nothing");
-            return;
-        }
-
-        let s = s.clone();
-        let connect_string = self.connect_string.clone();
-        let cluster_state_path = self.cluster_state_path.clone();
-        let last_backend = Arc::clone(&self.last_backend);
-        let task_log = self.log.clone();
-
-        let mut rt = Runtime::new().unwrap();
-
-        info!(self.log, "start(): starting runtime");
-        // Start the background event-processing task
-        rt.spawn(lazy(|| {
-            ManateePrimaryResolver::run(
-                connect_string,
-                cluster_state_path,
-                s,
-                last_backend,
-                task_log);
-            Ok(())
-        }));
-
-        // Save the required persistent state
-        *runtime = Some(rt);
-        debug!(self.log, "start() returned successfully");
-    }
-
-    fn stop(&mut self) {
-        debug!(self.log, "stop() method entered");
-        let mut runtime = self.runtime.lock().unwrap();
-        // If self.runtime is None, the Resolver is stopped, so we can return
-        // here without doing anyting.
-        if (*runtime).is_none() {
-            info!(self.log,
-                "Resolver not running; stop() method doing nothing");
-            return;
-        }
-
-        // Fun with the borrow checker:
-        //
-        // Calling shutdown_now() moves the Runtime struct out of the mutex.
-        // That's not allowed because Runtime doesn't implement Copy, and we
-        // can't clone the Runtime because Runtime doesn't implement Clone. It's
-        // actually be totally safe to move the Runtime out of the mutex here,
-        // because we intend to write a new value to the mutex later in this
-        // function, but the compiler doesn't know that. What we _can_ do is
-        // use mem::replace to move the Runtime and write a new value in one
-        // motion, so the mutex always has a valid value. Believe it or not,
-        // this is all safe. Very cool, I think!
-        let local_runtime = mem::replace(&mut *runtime, None);
-        // Furthermore, if we got here, local_runtime isn't None, because
-        // *runtime wasn't None, so we can unwrap local_runtime.
-        //
-        // We can also unwrap shutdown_now().wait(), because, as I understand
-        // it, shutdown_now cannot return an error. Indeed, the error type is
-        // ().
         info!(self.log, "Stopping runtime");
-        local_runtime.unwrap().shutdown_now().wait().unwrap();
-        debug!(self.log, "stop() returned successfully");
+        rt.shutdown_now().wait().unwrap();
+        info!(self.log, "Runtime stopped successfully");
+        self.is_running = false;
+        debug!(self.log, "run() returned successfully");
     }
 }
 
@@ -682,6 +637,7 @@ mod test {
     use super::*;
 
     use std::iter;
+    use std::sync::{Arc, Mutex};
     use std::sync::mpsc::channel;
 
     use quickcheck::{quickcheck, Arbitrary, Gen};
@@ -713,57 +669,54 @@ mod test {
 
     #[test]
     fn sandbox_test() {
-
         let conn_str = ZKConnectString::from_str(
-            "10.77.77.92:2181").unwrap();
+            "10.77.77.6:2181").unwrap();
         let path = "/manatee/1.moray.virtual.example.com".to_string();
-        let mut resolver = ManateePrimaryResolver::new(conn_str, path);
+        let resolver = Arc::new(Mutex::new(ManateePrimaryResolver::new(
+            conn_str, path)));
 
-        let (tx, rx) = channel();
-        resolver.start(tx.clone());
-        for _ in 0..4 {
-            match rx.recv() {
-                Ok(event) => {
-                    match event {
-                        BackendMsg::AddedMsg(msg) => {
-                            println!("Added: {:?}", msg.backend);
-                        },
-                        BackendMsg::RemovedMsg(msg) => {
-                            println!("Removed: {:?}", msg.0);
-                        },
-                        BackendMsg::StopMsg =>
-                            panic!("Stop message received; how???")
-                    }
-                }
-                Err(e) => {
-                    println!("oy! {:?}", e);
-                    break
-                },
-            }
-        }
-        println!("stopping");
-        resolver.stop();
-        println!("starting");
-        resolver.start(tx.clone());
         loop {
-            match rx.recv() {
-                Ok(event) => {
-                    match event {
-                        BackendMsg::AddedMsg(msg) => {
-                            println!("Added: {:?}", msg.backend);
-                        },
-                        BackendMsg::RemovedMsg(msg) => {
-                            println!("Removed: {:?}", msg.0);
-                        },
-                        BackendMsg::StopMsg =>
-                            panic!("Stop message received; how???")
+            println!("starting");
+            let (tx, rx) = channel();
+            let tx_clone = tx.clone();
+
+            let resolver_clone = Arc::clone(&resolver);
+            thread::spawn(move || {
+                let mut resolver = resolver_clone.lock().unwrap();
+                resolver.run(tx_clone);
+            });
+
+            let mut times = 0;
+            while times < 4 {
+                match rx.recv() {
+                    Ok(event) => {
+                        match event {
+                            BackendMsg::AddedMsg(msg) => {
+                                println!("Added: {:?}", msg.backend);
+                            },
+                            BackendMsg::RemovedMsg(msg) => {
+                                println!("Removed: {:?}", msg.0);
+                            },
+                            BackendMsg::StopMsg =>
+                                panic!("Stop message received; how???"),
+                            BackendMsg::HeartbeatMsg => {
+                                println!("heartbeat received");
+                                // Don't count a heartbeat as a message received
+                                times -= 1;
+                            }
+                        }
                     }
+                    Err(e) => {
+                        println!("oy! {:?}", e);
+                        break
+                    },
                 }
-                Err(e) => {
-                    println!("oyoy! {:?}", e);
-                    break
-                },
+                times += 1;
             }
+
+            println!("stopping");
+            drop(rx);
+            drop(tx);
         }
     }
  }
