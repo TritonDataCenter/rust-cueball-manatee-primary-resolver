@@ -18,7 +18,8 @@ use itertools::Itertools;
 use serde_json;
 use serde_json::Value as SerdeJsonValue;
 use serde_json::error::Error as SerdeJsonError;
-use slog::{error, info, debug, o, Drain, Key, LevelFilter, Logger, Record, Serializer};
+use slog::{error, info, debug, o, Drain, Key, LevelFilter, Logger, Record,
+    Serializer};
 use slog::Result as SlogResult;
 use slog::Value as SlogValue;
 use tokio_zookeeper::*;
@@ -140,7 +141,10 @@ pub struct ManateePrimaryResolver {
     /// The key representation of the last backend sent to the cueball
     /// connection pool. Persists across multiple calls to run().
     last_backend: Arc<Mutex<Option<BackendKey>>>,
-    /// Indicates whether or not the resolver is running
+    /// Indicates whether or not the resolver is running. This is slightly
+    /// superfluous (this field is `true` for exactly the duration of each
+    /// call to run(), and false otherwise), but could be useful if the caller
+    /// wants to check if the resolver is running for some reason.
     is_running: bool,
     /// The ManateePrimaryResolver's root log
     log: Logger
@@ -291,6 +295,14 @@ impl Resolver for ManateePrimaryResolver {
     // The resolver object is not Sync, so we can assume that only one instance
     // of this function is running at once, because callers will have to control
     // concurrent access.
+    //
+    // If the connection pool closes the receiving end of the channel, this
+    // function may not return right away -- this function will not notice that
+    // the pool has disconnected until this function tries to send another
+    // heartbeat, at which point this function will return. This means that the
+    // time between disconnection and function return is at most the length of
+    // HEARTBEAT_INTERVAL. Any change in the meantime will be picked up by the
+    // next call to run()
     fn run(&mut self, s: Sender<BackendMsg>) {
 
         // Represents the action to be taken in the event of a connection error.
@@ -311,12 +323,10 @@ impl Resolver for ManateePrimaryResolver {
         }
 
         debug!(self.log, "run() method entered");
-        if self.is_running {
-            info!(self.log,
-                "Resolver already running; run() method doing nothing");
-            return;
-        }
         let mut rt = Runtime::new().unwrap();
+        // There's no need to check if the pool is already running and return
+        // early, because multiple instances of this function _cannot_ be
+        // running concurrently -- see this function's header comment.
         self.is_running = true;
 
         // Variables moved to tokio runtime thread:
@@ -471,7 +481,7 @@ impl Resolver for ManateePrimaryResolver {
                                         },
                                         // The data watch fired
                                         WatchedEventType::NodeDataChanged => {
-                                            // We didn't  get the data, which
+                                            // We didn't get the data, which
                                             // means the node doesn't exist yet.
                                             // We should wait a bit and try
                                             // again. We'll just use the same
@@ -514,8 +524,19 @@ impl Resolver for ManateePrimaryResolver {
                                                 }
                                             }
                                         },
-                                        // TODO handle NodeDeleted instead of
-                                        // panicking
+                                        WatchedEventType::NodeDeleted => {
+                                            // Same behavior as the above case
+                                            // where we didn't get the data
+                                            // because the node doesn't exist.
+                                            // See comment above.
+                                            info!(log, "ZK node deleted");
+                                            return Either::A(ok(Loop::Continue(
+                                                InnerLoopState {
+                                                    watcher,
+                                                    curr_event,
+                                                    delay: INNER_LOOP_DELAY
+                                                })));
+                                        },
                                         e => panic!(
                                             "Unexpected event received: {:?}",
                                             e)
@@ -625,6 +646,10 @@ impl Resolver for ManateePrimaryResolver {
             thread::sleep(HEARTBEAT_INTERVAL);
         }
         info!(self.log, "Stopping runtime");
+        // We shut down the background watch-looping thread. It may have already
+        // exited by itself if it noticed that the connection pool closed its
+        // channel, but there's no harm still calling shutdown_now() in that
+        // case.
         rt.shutdown_now().wait().unwrap();
         info!(self.log, "Runtime stopped successfully");
         self.is_running = false;
