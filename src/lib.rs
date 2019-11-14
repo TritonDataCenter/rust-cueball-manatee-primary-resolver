@@ -2,12 +2,13 @@
  * Copyright 2019 Joyent, Inc.
  */
 
+use std::cmp::PartialEq;
 use std::convert::From;
 use std::fmt;
 use std::fmt::{Debug, Display};
 use std::net::{AddrParseError, SocketAddr};
 use std::str::{FromStr};
-use std::sync::mpsc::{Sender};
+use std::sync::mpsc::{Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -36,6 +37,8 @@ use cueball::resolver::{
     Resolver
 };
 
+pub mod util;
+
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 
 const RECONNECT_DELAY: Duration = Duration::from_secs(10);
@@ -44,54 +47,35 @@ const INNER_LOOP_DELAY: Duration = Duration::from_secs(10);
 const INNER_LOOP_NODELAY: Duration = Duration::from_secs(0);
 
 // An error type to be used internally.
-// The "should_stop" field indicates whether the Resolver should stop in
-// response to the error -- if false, it will instead continue watching for
-// cluster state changes.
-#[derive(Debug, Clone)]
-pub struct ResolverError {
-    message: String,
-    should_stop: bool
+#[derive(Clone, Debug, PartialEq)]
+enum ResolverError {
+    InvalidZkJson,
+    InvalidZkData(ZkDataField),
+    MissingZkData(ZkDataField),
+    ConnectionPoolShutdown
 }
 
-impl Display for ResolverError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "ResolverError: {:?}, {:?}", self.message, self.should_stop)
-    }
-}
-
-
-impl From<ParseError> for ResolverError {
-    fn from(e: ParseError) -> Self {
-        ResolverError {
-            message: format!("{:?}", e),
-            should_stop: false
+impl ResolverError {
+    fn should_stop(&self) -> bool {
+        match self {
+            ResolverError::ConnectionPoolShutdown => true,
+            _ => false
         }
     }
 }
 
-impl From<SerdeJsonError> for ResolverError {
-    fn from(e: SerdeJsonError) -> Self {
-        ResolverError {
-            message: format!("{:?}", e),
-            should_stop: false
-        }
-    }
+#[derive(Clone, Debug, PartialEq)]
+enum ZkDataField {
+    Ip,
+    Port,
+    PostgresUrl
 }
 
-impl From<AddrParseError> for ResolverError {
-    fn from(e: AddrParseError) -> Self {
-        ResolverError {
-            message: format!("{:?}", e),
-            should_stop: false
-        }
-    }
-}
-
-/// `ZKConnectString` represents a list of zookeeper addresses to connect to.
+/// `ZkConnectString` represents a list of zookeeper addresses to connect to.
 #[derive(Debug, Clone, PartialEq)]
-pub struct ZKConnectString(Vec<SocketAddr>);
+pub struct ZkConnectString(Vec<SocketAddr>);
 
-impl ToString for ZKConnectString {
+impl ToString for ZkConnectString {
     fn to_string(&self) -> String {
         self
             .0
@@ -102,7 +86,7 @@ impl ToString for ZKConnectString {
     }
 }
 
-impl FromStr for ZKConnectString {
+impl FromStr for ZkConnectString {
     type Err = std::net::AddrParseError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
@@ -119,7 +103,7 @@ impl FromStr for ZKConnectString {
                     (_, Err(e)) => Err(e)
                 }
             })
-            .and_then(|x| Ok(ZKConnectString(x)))
+            .and_then(|x| Ok(ZkConnectString(x)))
     }
 }
 
@@ -134,7 +118,7 @@ impl<T: Debug> SlogValue for LogItem<T> {
 #[derive(Debug)]
 pub struct ManateePrimaryResolver {
     /// The addresses of the Zookeeper cluster the Resolver is connecting to
-    connect_string: ZKConnectString,
+    connect_string: ZkConnectString,
     /// The Zookeeper path for manatee cluster state for the shard. *e.g.*
     /// "/manatee/1.moray.coal.joyent.us/state"
     cluster_state_path: String,
@@ -160,11 +144,11 @@ impl ManateePrimaryResolver {
     /// * `path` - The path to the root node in zookeeper for the shard we're
     //    watching
     pub fn new(
-        connect_string: ZKConnectString,
+        connect_string: ZkConnectString,
         path: String
     ) -> Self
     {
-        let cluster_state_path = [&path, "/dean"].concat();
+        let cluster_state_path = [&path, "/state"].concat();
 
         ManateePrimaryResolver {
             connect_string: connect_string.clone(),
@@ -198,48 +182,61 @@ impl ManateePrimaryResolver {
     /// * `last_backend` - The last Backend we sent to the connection pool
     fn process_value(
         pool_tx: &Sender<BackendMsg>,
-        new_value: &(Vec<u8>, Stat),
+        new_value: &Vec<u8>,
         last_backend: Arc<Mutex<Option<BackendKey>>>,
         log: Logger
     ) -> Result<(), ResolverError> {
         debug!(log, "process_value() entered");
 
-        let v: SerdeJsonValue = serde_json::from_slice(&new_value.0)?;
+        let v: SerdeJsonValue = match serde_json::from_slice(&new_value) {
+            Ok(v) => v,
+            Err(_) => {
+                return Err(ResolverError::InvalidZkJson);
+            }
+        };
 
         // Parse out the ip. We expect the json fields to exist, and return an
-        // error if they don't.
+        // error if they don't, or if they are of the wrong type.
         let ip = match &v["primary"]["ip"] {
-            SerdeJsonValue::String(s) => BackendAddress::from_str(s)?,
+            SerdeJsonValue::String(s) => {
+                match BackendAddress::from_str(s) {
+                    Ok(s) => s,
+                    Err(_) => {
+                        return Err(ResolverError::InvalidZkData(ZkDataField::Ip));
+                    }
+                }
+            },
+            SerdeJsonValue::Null => {
+                return Err(ResolverError::MissingZkData(ZkDataField::Ip));
+            },
             _ => {
-                return Err(ResolverError {
-                    message: "Malformed zookeeper primary data received for \
-                        \"ip\" field".to_string(),
-                    should_stop: false
-                });
+                return Err(ResolverError::InvalidZkData(ZkDataField::Ip));
             }
         };
 
         // Parse out the port. We expect the json fields to exist, and return an
-        // error if they don't.
+        // error if they don't, or if they are of the wrong type.
         let port = match &v["primary"]["pgUrl"] {
             SerdeJsonValue::String(s) => {
-                match Url::parse(s)?.port() {
-                    Some(port) => port,
-                    None => {
-                        return Err(ResolverError {
-                            message: "primary's postgres URL contains no port"
-                                .to_string(),
-                            should_stop: false
-                        })
+                match Url::parse(s) {
+                    Ok(url) => {
+                        match url.port() {
+                            Some(port) => port,
+                            None => {
+                                return Err(ResolverError::MissingZkData(ZkDataField::Port));
+                            }
+                        }
+                    },
+                    Err(_) => {
+                        return Err(ResolverError::InvalidZkData(ZkDataField::PostgresUrl))
                     }
                 }
             },
+            SerdeJsonValue::Null => {
+                return Err(ResolverError::MissingZkData(ZkDataField::PostgresUrl));
+            },
             _ => {
-                return Err(ResolverError {
-                    message: "Malformed zookeeper primary data received for \
-                        \"pgUrl\" field".to_string(),
-                    should_stop: false
-                })
+                return Err(ResolverError::InvalidZkData(ZkDataField::PostgresUrl));
             }
         };
 
@@ -260,10 +257,7 @@ impl ManateePrimaryResolver {
                 key: backend_key.clone(),
                 backend
             })).is_err() {
-                return Err(ResolverError {
-                    message: "Connection pool shutting down".to_string(),
-                    should_stop: true
-                });
+                return Err(ResolverError::ConnectionPoolShutdown);
             }
 
             let lb_clone = (*last_backend).clone();
@@ -276,10 +270,7 @@ impl ManateePrimaryResolver {
                     "Notifying connection pool of removal of old backend");
                 if pool_tx.send(BackendMsg::RemovedMsg(
                     BackendRemovedMsg(lbc))).is_err() {
-                    return Err(ResolverError {
-                        message: "Connection pool shutting down".to_string(),
-                        should_stop: true
-                    });
+                    return Err(ResolverError::ConnectionPoolShutdown);
                 }
             }
         } else {
@@ -496,11 +487,14 @@ impl Resolver for ManateePrimaryResolver {
                                                         delay: INNER_LOOP_DELAY
                                                     })));
                                             }
+                                            // Discard the Stat, as we don't use
+                                            // it.
+                                            let data = data.unwrap().0;
                                             info!(log, "got data"; "data" =>
                                                 LogItem(data.clone()));
                                             match ManateePrimaryResolver::process_value(
                                                 &pool_tx.clone(),
-                                                &data.unwrap(),
+                                                &data,
                                                 Arc::clone(&last_backend),
                                                 log.clone()) {
                                                 Ok(_) => {},
@@ -516,7 +510,7 @@ impl Resolver for ManateePrimaryResolver {
                                                     // reconnect here and can
                                                     // continue, unless the
                                                     // error tells us to stop.
-                                                    if e.should_stop {
+                                                    if e.should_stop() {
                                                         return Either::A(ok(
                                                             Loop::Break(
                                                             NextAction::Stop)));
@@ -657,6 +651,7 @@ impl Resolver for ManateePrimaryResolver {
     }
 }
 
+// Unit tests
 #[cfg(test)]
 mod test {
     use super::*;
@@ -664,13 +659,18 @@ mod test {
     use std::iter;
     use std::sync::{Arc, Mutex};
     use std::sync::mpsc::channel;
+    use std::vec::Vec;
 
     use quickcheck::{quickcheck, Arbitrary, Gen};
+    use tokio_zookeeper::{Acl, CreateMode};
+    use uuid::Uuid;
 
-    impl Arbitrary for ZKConnectString {
+    use super::util;
+
+    impl Arbitrary for ZkConnectString {
         fn arbitrary<G: Gen>(g: &mut G) -> Self {
             let size = usize::arbitrary(g);
-            ZKConnectString(
+            ZkConnectString(
                 iter::repeat(())
                     .map(|()| SocketAddr::arbitrary(g))
                     .take(size)
@@ -679,69 +679,573 @@ mod test {
         }
     }
 
+    // Test parsing ZkConnectString from string
     quickcheck! {
         fn prop_zk_connect_string_parse(
-            connect_string: ZKConnectString
+            connect_string: ZkConnectString
         ) -> bool
         {
             // We expect an error only if the input string was zero-length
-            match ZKConnectString::from_str(&connect_string.to_string()) {
+            match ZkConnectString::from_str(&connect_string.to_string()) {
                 Ok(cs) => cs == connect_string,
                 _ => connect_string.to_string() == ""
             }
         }
     }
 
-    #[test]
-    fn sandbox_test() {
-        let conn_str = ZKConnectString::from_str(
-            "10.77.77.6:2181").unwrap();
-        let path = "/manatee/1.moray.virtual.example.com".to_string();
-        let resolver = Arc::new(Mutex::new(ManateePrimaryResolver::new(
-            conn_str, path)));
+    fn test_log() -> Logger {
+        Logger::root(
+            Mutex::new(LevelFilter::new(
+                slog_bunyan::with_name(crate_name!(),
+                    std::io::stdout()).build(),
+                slog::Level::Critical)).fuse(),
+                o!("build-id" => crate_version!()))
+    }
 
-        loop {
-            println!("starting");
-            let (tx, rx) = channel();
-            let tx_clone = tx.clone();
+    #[derive(Clone)]
+    struct BackendData {
+        raw: Vec<u8>,
+        object: Backend
+    }
 
-            let resolver_clone = Arc::clone(&resolver);
-            thread::spawn(move || {
-                let mut resolver = resolver_clone.lock().unwrap();
-                resolver.run(tx_clone);
-            });
+    impl BackendData {
+        // Most of the data here isn't relevant, but real json from zookeeper
+        // will include it.
+        fn new(ip: &str, port: u16) -> Self {
+            let raw = format!(r#" {{
+                "generation": 1,
+                "primary": {{
+                    "id": "{ip}:{port}:12345",
+                    "ip": "{ip}",
+                    "pgUrl": "tcp://postgres@{ip}:{port}/postgres",
+                    "zoneId": "f47c4766-1857-4bdc-97f0-c1fd009c955b",
+                    "backupUrl": "http://{ip}:12345"
+                }},
+                "sync": {{
+                    "id": "10.77.77.21:5432:12345",
+                    "zoneId": "f8727df9-c639-4152-a861-c77a878ca387",
+                    "ip": "10.77.77.21",
+                    "pgUrl": "tcp://postgres@10.77.77.21:5432/postgres",
+                    "backupUrl": "http://10.77.77.21:12345"
+                }},
+                "async": [],
+                "deposed": [
+                    {{
+                        "id":"10.77.77.22:5432:12345",
+                        "ip": "10.77.77.22",
+                        "pgUrl": "tcp://postgres@10.77.77.22:5432/postgres",
+                        "zoneId": "c7a64f9f-4d49-4e6b-831a-68fd6ebf1d3c",
+                        "backupUrl": "http://10.77.77.22:12345"
+                    }}
+                ],
+                "initWal": "0/16522D8"
+            }}"#, ip = ip, port = port).as_bytes().to_vec();
 
-            let mut times = 0;
-            while times < 4 {
-                match rx.recv() {
-                    Ok(event) => {
-                        match event {
-                            BackendMsg::AddedMsg(msg) => {
-                                println!("Added: {:?}", msg.backend);
-                            },
-                            BackendMsg::RemovedMsg(msg) => {
-                                println!("Removed: {:?}", msg.0);
-                            },
-                            BackendMsg::StopMsg =>
-                                panic!("Stop message received; how???"),
-                            BackendMsg::HeartbeatMsg => {
-                                println!("heartbeat received");
-                                // Don't count a heartbeat as a message received
-                                times -= 1;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        println!("oy! {:?}", e);
-                        break
-                    },
-                }
-                times += 1;
+            BackendData {
+                raw,
+                object: Backend::new(&BackendAddress::from_str(ip).unwrap(), port)
             }
-
-            println!("stopping");
-            drop(rx);
-            drop(tx);
         }
+
+        fn raw(&self) -> Vec<u8> {
+            self.raw.clone()
+        }
+
+        fn key(&self) -> BackendKey {
+            srv_key(&self.object)
+        }
+
+        fn added_msg(&self) -> BackendAddedMsg {
+            BackendAddedMsg {
+                key: self.key(),
+                backend: self.object.clone()
+            }
+        }
+
+        fn removed_msg(&self) -> BackendRemovedMsg {
+            BackendRemovedMsg(self.key())
+        }
+    }
+
+    fn backend_ip1_port1() -> BackendData {
+        BackendData::new("10.77.77.28", 5432)
+    }
+
+    fn backend_ip1_port2() -> BackendData {
+        BackendData::new("10.77.77.28", 5431)
+    }
+
+    fn backend_ip2_port1() -> BackendData {
+        BackendData::new("10.77.77.21", 5432)
+    }
+
+    fn backend_ip2_port2() -> BackendData {
+        BackendData::new("10.77.77.21", 5431)
+    }
+
+    fn raw_invalid_json() -> Vec<u8> {
+        "foo".as_bytes().to_vec()
+    }
+
+    fn raw_no_ip() -> Vec<u8> {
+        r#" {
+                "generation": 1,
+                "primary": {
+                    "id": "10.77.77.21:5432:12345",
+                    "zoneId": "f8727df9-c639-4152-a861-c77a878ca387",
+                    "pgUrl": "tcp://postgres@10.77.77.21:5432/postgres",
+                    "backupUrl": "http://10.77.77.21:12345"
+                },
+                "sync": {
+                    "id": "10.77.77.28:5432:12345",
+                    "ip": "10.77.77.28",
+                    "pgUrl": "tcp://postgres@10.77.77.28:5432/postgres",
+                    "zoneId": "f47c4766-1857-4bdc-97f0-c1fd009c955b",
+                    "backupUrl": "http://10.77.77.28:12345"
+                },
+                "async": [],
+                "deposed": [
+                    {
+                        "id":"10.77.77.22:5432:12345",
+                        "ip": "10.77.77.22",
+                        "pgUrl": "tcp://postgres@10.77.77.22:5432/postgres",
+                        "zoneId": "c7a64f9f-4d49-4e6b-831a-68fd6ebf1d3c",
+                        "backupUrl": "http://10.77.77.22:12345"
+                    }
+                ],
+                "initWal": "0/16522D8"
+            }
+        "#.as_bytes().to_vec()
+    }
+
+    fn raw_invalid_ip() -> Vec<u8> {
+        r#" {
+                "generation": 1,
+                "primary": {
+                    "id": "10.77.77.21:5432:12345",
+                    "zoneId": "f8727df9-c639-4152-a861-c77a878ca387",
+                    "ip": "foo",
+                    "pgUrl": "tcp://postgres@10.77.77.21:5432/postgres",
+                    "backupUrl": "http://10.77.77.21:12345"
+                },
+                "sync": {
+                    "id": "10.77.77.28:5432:12345",
+                    "ip": "10.77.77.28",
+                    "pgUrl": "tcp://postgres@10.77.77.28:5432/postgres",
+                    "zoneId": "f47c4766-1857-4bdc-97f0-c1fd009c955b",
+                    "backupUrl": "http://10.77.77.28:12345"
+                },
+                "async": [],
+                "deposed": [
+                    {
+                        "id":"10.77.77.22:5432:12345",
+                        "ip": "10.77.77.22",
+                        "pgUrl": "tcp://postgres@10.77.77.22:5432/postgres",
+                        "zoneId": "c7a64f9f-4d49-4e6b-831a-68fd6ebf1d3c",
+                        "backupUrl": "http://10.77.77.22:12345"
+                    }
+                ],
+                "initWal": "0/16522D8"
+            }
+        "#.as_bytes().to_vec()
+    }
+
+    fn raw_wrong_type_ip() -> Vec<u8> {
+        r#" {
+                "generation": 1,
+                "primary": {
+                    "id": "10.77.77.21:5432:12345",
+                    "zoneId": "f8727df9-c639-4152-a861-c77a878ca387",
+                    "ip": true,
+                    "pgUrl": "tcp://postgres@10.77.77.21:5432/postgres",
+                    "backupUrl": "http://10.77.77.21:12345"
+                },
+                "sync": {
+                    "id": "10.77.77.28:5432:12345",
+                    "ip": "10.77.77.28",
+                    "pgUrl": "tcp://postgres@10.77.77.28:5432/postgres",
+                    "zoneId": "f47c4766-1857-4bdc-97f0-c1fd009c955b",
+                    "backupUrl": "http://10.77.77.28:12345"
+                },
+                "async": [],
+                "deposed": [
+                    {
+                        "id":"10.77.77.22:5432:12345",
+                        "ip": "10.77.77.22",
+                        "pgUrl": "tcp://postgres@10.77.77.22:5432/postgres",
+                        "zoneId": "c7a64f9f-4d49-4e6b-831a-68fd6ebf1d3c",
+                        "backupUrl": "http://10.77.77.22:12345"
+                    }
+                ],
+                "initWal": "0/16522D8"
+            }
+        "#.as_bytes().to_vec()
+    }
+
+    fn raw_no_pg_url() -> Vec<u8> {
+        r#" {
+                "generation": 1,
+                "primary": {
+                    "id": "10.77.77.28:5432:12345",
+                    "ip": "10.77.77.28",
+                    "zoneId": "f47c4766-1857-4bdc-97f0-c1fd009c955b",
+                    "backupUrl": "http://10.77.77.28:12345"
+                },
+                "sync": {
+                    "id": "10.77.77.21:5432:12345",
+                    "zoneId": "f8727df9-c639-4152-a861-c77a878ca387",
+                    "ip": "10.77.77.21",
+                    "pgUrl": "tcp://postgres@10.77.77.21:5432/postgres",
+                    "backupUrl": "http://10.77.77.21:12345"
+                },
+                "async": [],
+                "deposed": [
+                    {
+                        "id":"10.77.77.22:5432:12345",
+                        "ip": "10.77.77.22",
+                        "pgUrl": "tcp://postgres@10.77.77.22:5432/postgres",
+                        "zoneId": "c7a64f9f-4d49-4e6b-831a-68fd6ebf1d3c",
+                        "backupUrl": "http://10.77.77.22:12345"
+                    }
+                ],
+                "initWal": "0/16522D8"
+            }
+        "#.as_bytes().to_vec()
+    }
+
+    fn raw_invalid_pg_url() -> Vec<u8> {
+        r#" {
+                "generation": 1,
+                "primary": {
+                    "id": "10.77.77.28:5432:12345",
+                    "ip": "10.77.77.28",
+                    "pgUrl": "foo",
+                    "zoneId": "f47c4766-1857-4bdc-97f0-c1fd009c955b",
+                    "backupUrl": "http://10.77.77.28:12345"
+                },
+                "sync": {
+                    "id": "10.77.77.21:5432:12345",
+                    "zoneId": "f8727df9-c639-4152-a861-c77a878ca387",
+                    "ip": "10.77.77.21",
+                    "pgUrl": "tcp://postgres@10.77.77.21:5432/postgres",
+                    "backupUrl": "http://10.77.77.21:12345"
+                },
+                "async": [],
+                "deposed": [
+                    {
+                        "id":"10.77.77.22:5432:12345",
+                        "ip": "10.77.77.22",
+                        "pgUrl": "tcp://postgres@10.77.77.22:5432/postgres",
+                        "zoneId": "c7a64f9f-4d49-4e6b-831a-68fd6ebf1d3c",
+                        "backupUrl": "http://10.77.77.22:12345"
+                    }
+                ],
+                "initWal": "0/16522D8"
+            }
+        "#.as_bytes().to_vec()
+    }
+
+    fn raw_wrong_type_pg_url() -> Vec<u8> {
+        r#" {
+                "generation": 1,
+                "primary": {
+                    "id": "10.77.77.28:5432:12345",
+                    "ip": "10.77.77.28",
+                    "pgUrl": true,
+                    "zoneId": "f47c4766-1857-4bdc-97f0-c1fd009c955b",
+                    "backupUrl": "http://10.77.77.28:12345"
+                },
+                "sync": {
+                    "id": "10.77.77.21:5432:12345",
+                    "zoneId": "f8727df9-c639-4152-a861-c77a878ca387",
+                    "ip": "10.77.77.21",
+                    "pgUrl": "tcp://postgres@10.77.77.21:5432/postgres",
+                    "backupUrl": "http://10.77.77.21:12345"
+                },
+                "async": [],
+                "deposed": [
+                    {
+                        "id":"10.77.77.22:5432:12345",
+                        "ip": "10.77.77.22",
+                        "pgUrl": "tcp://postgres@10.77.77.22:5432/postgres",
+                        "zoneId": "c7a64f9f-4d49-4e6b-831a-68fd6ebf1d3c",
+                        "backupUrl": "http://10.77.77.22:12345"
+                    }
+                ],
+                "initWal": "0/16522D8"
+            }
+        "#.as_bytes().to_vec()
+    }
+
+    fn raw_no_port_pg_url() -> Vec<u8> {
+        r#" {
+                "generation": 1,
+                "primary": {
+                    "id": "10.77.77.28:5432:12345",
+                    "ip": "10.77.77.28",
+                    "pgUrl": "tcp://postgres@10.77.77.22/postgres",
+                    "zoneId": "f47c4766-1857-4bdc-97f0-c1fd009c955b",
+                    "backupUrl": "http://10.77.77.28:12345"
+                },
+                "sync": {
+                    "id": "10.77.77.21:5432:12345",
+                    "zoneId": "f8727df9-c639-4152-a861-c77a878ca387",
+                    "ip": "10.77.77.21",
+                    "pgUrl": "tcp://postgres@10.77.77.21:5432/postgres",
+                    "backupUrl": "http://10.77.77.21:12345"
+                },
+                "async": [],
+                "deposed": [
+                    {
+                        "id":"10.77.77.22:5432:12345",
+                        "ip": "10.77.77.22",
+                        "pgUrl": "tcp://postgres@10.77.77.22:5432/postgres",
+                        "zoneId": "c7a64f9f-4d49-4e6b-831a-68fd6ebf1d3c",
+                        "backupUrl": "http://10.77.77.22:12345"
+                    }
+                ],
+                "initWal": "0/16522D8"
+            }
+        "#.as_bytes().to_vec()
+    }
+
+    // Represents a process_value test case, including inputs and expected
+    // outputs.
+    struct ProcessValueFields {
+        value: Vec<u8>,
+        last_backend: BackendKey,
+        expected_error: Option<ResolverError>,
+        message_count: u32,
+        added_backend: Option<BackendAddedMsg>,
+        removed_backend: Option<BackendRemovedMsg>
+    }
+
+    // Run a process_value test case
+    fn run_process_value_fields(input: ProcessValueFields) {
+        let (tx, rx) = channel();
+        let last_backend = Arc::new(Mutex::new(Some(input.last_backend)));
+
+        let result = ManateePrimaryResolver::process_value(
+            &tx.clone(),
+            &input.value,
+            last_backend,
+            test_log());
+        match input.expected_error {
+            None => assert_eq!(result, Ok(())),
+            Some(expected_error) => {
+                assert_eq!(result, Err(expected_error))
+            }
+        }
+
+        let mut received_messages = Vec::new();
+
+        // Receive as many messages as we expect
+        for i in 0..input.message_count {
+            let channel_result = rx.try_recv();
+            match channel_result {
+                Err(e) => panic!("Unexpected error receiving on channel: {:?} -- Loop iteration: {:?}", e, i),
+                Ok(result) => {
+                    received_messages.push(result);
+                }
+            }
+        }
+        // Can't use assert_eq! here because BackendMsg doesn't implement Debug
+        match rx.try_recv() {
+            Err(TryRecvError::Empty) => (),
+            _ => panic!("Unexpected message on resolver channel")
+        }
+
+        if let Some(msg) = input.added_backend {
+            let msg = BackendMsg::AddedMsg(msg);
+            match util::find_msg_match(&received_messages, &msg) {
+                None => panic!("added_backend not found in received messages"),
+                Some(index) => {
+                    received_messages.remove(index);
+                    ()
+                }
+            }
+        }
+
+        if let Some(msg) = input.removed_backend {
+            let msg = BackendMsg::RemovedMsg(msg);
+            match util::find_msg_match(&received_messages, &msg) {
+                None => panic!("removed_backend not found in received messages"),
+                Some(index) => {
+                    received_messages.remove(index);
+                    ()
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn port_ip_change_test() {
+        let data_1 = backend_ip1_port1();
+        let data_2 = backend_ip2_port2();
+
+        run_process_value_fields(ProcessValueFields{
+            value: data_2.raw(),
+            last_backend: data_1.key(),
+            expected_error: None,
+            message_count: 2,
+            added_backend: Some(data_2.added_msg()),
+            removed_backend: Some(data_1.removed_msg())
+        });
+    }
+
+    #[test]
+    fn port_change_test() {
+        let data_1 = backend_ip1_port1();
+        let data_2 = backend_ip2_port1();
+
+        run_process_value_fields(ProcessValueFields{
+            value: data_2.raw(),
+            last_backend: data_1.key(),
+            expected_error: None,
+            message_count: 2,
+            added_backend: Some(data_2.added_msg()),
+            removed_backend: Some(data_1.removed_msg())
+        });
+    }
+
+    #[test]
+    fn ip_change_test() {
+        let data_1 = backend_ip1_port1();
+        let data_2 = backend_ip1_port2();
+
+        run_process_value_fields(ProcessValueFields{
+            value: data_2.raw(),
+            last_backend: data_1.key(),
+            expected_error: None,
+            message_count: 2,
+            added_backend: Some(data_2.added_msg()),
+            removed_backend: Some(data_1.removed_msg())
+        });
+    }
+
+    #[test]
+    fn no_change_test() {
+        let data = backend_ip1_port1();
+
+        run_process_value_fields(ProcessValueFields{
+            value: data.raw(),
+            last_backend: data.key(),
+            expected_error: None,
+            message_count: 0,
+            added_backend: None,
+            removed_backend: None
+        });
+    }
+
+    #[test]
+    fn no_ip_test() {
+        let filler = backend_ip1_port1();
+
+        run_process_value_fields(ProcessValueFields{
+            value: raw_no_ip(),
+            last_backend: filler.key(),
+            expected_error: Some(ResolverError::MissingZkData(ZkDataField::Ip)),
+            message_count: 0,
+            added_backend: None,
+            removed_backend: None
+        });
+    }
+
+    #[test]
+    fn wrong_type_ip_test() {
+        let filler = backend_ip1_port1();
+
+        run_process_value_fields(ProcessValueFields{
+            value: raw_wrong_type_ip(),
+            last_backend: filler.key(),
+            expected_error: Some(ResolverError::InvalidZkData(ZkDataField::Ip)),
+            message_count: 0,
+            added_backend: None,
+            removed_backend: None
+        });
+    }
+
+    #[test]
+    fn invalid_ip_test() {
+        let filler = backend_ip1_port1();
+
+        run_process_value_fields(ProcessValueFields{
+            value: raw_invalid_ip(),
+            last_backend: filler.key(),
+            expected_error: Some(ResolverError::InvalidZkData(ZkDataField::Ip)),
+            message_count: 0,
+            added_backend: None,
+            removed_backend: None
+        });
+    }
+
+    #[test]
+    fn no_pg_url_test() {
+        let filler = backend_ip1_port1();
+
+        run_process_value_fields(ProcessValueFields{
+            value: raw_no_pg_url(),
+            last_backend: filler.key(),
+            expected_error: Some(ResolverError::MissingZkData(ZkDataField::PostgresUrl)),
+            message_count: 0,
+            added_backend: None,
+            removed_backend: None
+        });
+    }
+
+    #[test]
+    fn wrong_type_pg_url_test() {
+        let filler = backend_ip1_port1();
+
+        run_process_value_fields(ProcessValueFields{
+            value: raw_wrong_type_pg_url(),
+            last_backend: filler.key(),
+            expected_error: Some(ResolverError::InvalidZkData(ZkDataField::PostgresUrl)),
+            message_count: 0,
+            added_backend: None,
+            removed_backend: None
+        });
+    }
+
+    #[test]
+    fn invalid_pg_url_test() {
+        let filler = backend_ip1_port1();
+
+        run_process_value_fields(ProcessValueFields{
+            value: raw_invalid_pg_url(),
+            last_backend: filler.key(),
+            expected_error: Some(ResolverError::InvalidZkData(ZkDataField::PostgresUrl)),
+            message_count: 0,
+            added_backend: None,
+            removed_backend: None
+        });
+    }
+
+    #[test]
+    fn no_port_pg_url_test() {
+        let filler = backend_ip1_port1();
+
+        run_process_value_fields(ProcessValueFields{
+            value: raw_no_port_pg_url(),
+            last_backend: filler.key(),
+            expected_error: Some(ResolverError::MissingZkData(ZkDataField::Port)),
+            message_count: 0,
+            added_backend: None,
+            removed_backend: None
+        });
+    }
+
+    #[test]
+    fn invalid_json_test() {
+        let filler = backend_ip1_port1();
+
+        run_process_value_fields(ProcessValueFields{
+            value: raw_invalid_json(),
+            last_backend: filler.key(),
+            expected_error: Some(ResolverError::InvalidZkJson),
+            message_count: 0,
+            added_backend: None,
+            removed_backend: None
+        });
     }
  }

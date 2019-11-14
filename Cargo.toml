@@ -19,3 +19,6 @@ slog-bunyan = { git = "https://github.com/slog-rs/bunyan" }
 tokio = "0.1.22"
 tokio-zookeeper = { git = 'https://github.com/joyent/tokio-zookeeper', branch = "temp-fix"}
 url = "2.1.0"
+
+[dev-dependencies]
+uuid = { version = "0.8", features = ["v4"] }
