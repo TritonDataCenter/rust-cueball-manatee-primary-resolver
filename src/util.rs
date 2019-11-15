@@ -23,7 +23,7 @@ fn msgs_equal(a: &BackendMsg, b: &BackendMsg) -> bool {
 
 }
 
-pub fn find_msg_match(list: &Vec<BackendMsg>, to_find: &BackendMsg)
+pub fn find_msg_match(list: &[BackendMsg], to_find: &BackendMsg)
     -> Option<usize> {
     for (index, item) in list.iter().enumerate() {
         if msgs_equal(item, to_find) {

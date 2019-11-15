@@ -6,8 +6,7 @@ edition = "2018"
 
 [dependencies]
 clap = "2.32"
-cueball = { path = '../rust-cueball' }
-#cueball = { git = 'https://github.com/joyent/rust-cueball', tag = 'v0.1.0' }
+cueball = { git = 'https://github.com/joyent/rust-cueball', tag = 'v0.2.0' }
 itertools = "0.8.0"
 failure = "0.1.5"
 futures = "0.1.28"
