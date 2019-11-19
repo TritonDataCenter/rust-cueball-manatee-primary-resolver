@@ -4,29 +4,16 @@ use cueball::resolver::{
     BackendMsg,
 };
 
-fn msgs_equal(a: &BackendMsg, b: &BackendMsg) -> bool {
-    match (a, b) {
-        (BackendMsg::AddedMsg(a), BackendMsg::AddedMsg(b)) => {
-            a.key == b.key
-        },
-        (BackendMsg::RemovedMsg(a), BackendMsg::RemovedMsg(b)) => {
-            a.0 == b.0
-        },
-        (BackendMsg::StopMsg, BackendMsg::StopMsg) => {
-            true
-        },
-        (BackendMsg::HeartbeatMsg, BackendMsg::HeartbeatMsg) => {
-            true
-        },
-        _ => false
-    }
-
-}
-
+///
+/// Given a list of BackendMsg and a BackendMsg to find, returns the index of
+/// the desired item in the list, or None if the item is not in the list. We
+/// return the index, rather than the item itself, to allow callers of the
+/// function to more easily manipulate the list afterward.
+///
 pub fn find_msg_match(list: &[BackendMsg], to_find: &BackendMsg)
     -> Option<usize> {
     for (index, item) in list.iter().enumerate() {
-        if msgs_equal(item, to_find) {
+        if item == to_find {
             return Some(index);
         }
     }

@@ -104,11 +104,33 @@ enum ZkDataField {
     PostgresUrl
 }
 
+#[derive(Debug)]
+pub enum ZkConnectStringError {
+    EmptyString,
+    MalformedAddr
+}
+
+impl From<AddrParseError> for ZkConnectStringError {
+    fn from(_: AddrParseError) -> Self {
+        ZkConnectStringError::MalformedAddr
+    }
+}
+
 ///
 /// `ZkConnectString` represents a list of zookeeper addresses to connect to.
 ///
 #[derive(Debug, Clone, PartialEq)]
 pub struct ZkConnectString(Vec<SocketAddr>);
+
+impl ZkConnectString {
+    ///
+    /// Gets a reference to the SocketAddr at the provided index. Returns None
+    /// if the index is out of bounds.
+    ///
+    fn get_addr_at(&self, index: usize) -> Option<&SocketAddr> {
+        self.0.get(index)
+    }
+}
 
 impl ToString for ZkConnectString {
     fn to_string(&self) -> String {
@@ -122,9 +144,12 @@ impl ToString for ZkConnectString {
 }
 
 impl FromStr for ZkConnectString {
-    type Err = AddrParseError;
+    type Err = ZkConnectStringError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.is_empty() {
+            return Err(ZkConnectStringError::EmptyString);
+        }
         let acc: Result<Vec<SocketAddr>, Self::Err> = Ok(vec![]);
         s.split(',')
             .map(|x| SocketAddr::from_str(x))
@@ -135,7 +160,7 @@ impl FromStr for ZkConnectString {
                         Ok(addrs)
                     },
                     (Err(e), _) => Err(e),
-                    (_, Err(e)) => Err(e)
+                    (_, Err(e)) => Err(ZkConnectStringError::from(e))
                 }
             })
             .and_then(|x| Ok(ZkConnectString(x)))
@@ -148,6 +173,7 @@ impl FromStr for ZkConnectString {
 /// serialized output.
 ///
 struct LogItem<T>(T) where T: Debug;
+
 impl<T: Debug> SlogValue for LogItem<T> {
     fn serialize(&self, _rec: &Record, key: Key,
         serializer: &mut dyn Serializer) -> SlogResult {
@@ -218,30 +244,40 @@ impl ManateePrimaryResolver {
     ///
     pub fn new(
         connect_string: ZkConnectString,
-        path: String
+        path: String,
+        log: Option<Logger>
     ) -> Self
     {
         let cluster_state_path = [&path, "/state"].concat();
 
-        ManateePrimaryResolver {
-            connect_string: connect_string.clone(),
-            cluster_state_path: cluster_state_path.clone(),
-            last_backend: Arc::new(Mutex::new(None)),
-            is_running: false,
-            log: Logger::root(
+        let log_values = o!(
+            "build-id" => crate_version!(),
+            "connect_string" => LogItem(connect_string.to_string()),
+            "path" => cluster_state_path.clone()
+        );
+
+        //
+        // Add the log_values to the passed-in logger, or create a new logger if
+        // the caller did not pass one in
+        //
+        let log = match log {
+            Some(log) => log.new(log_values),
+            None => Logger::root(
                 Mutex::new(LevelFilter::new(
                     slog_bunyan::with_name(crate_name!(),
                         std::io::stdout()).build(),
-                    //
-                    // TODO replace with user-configurable log level? How?
-                    //
-                    slog::Level::Trace,
-                ))
-                .fuse(),
-                o!("build-id" => crate_version!(),
-                    "connect_string" => LogItem(connect_string.to_string()),
-                    "path" => cluster_state_path),
+                    slog::Level::Info,
+                )).fuse(),
+                log_values
             )
+        };
+
+        ManateePrimaryResolver {
+            connect_string: connect_string.clone(),
+            cluster_state_path,
+            last_backend: Arc::new(Mutex::new(None)),
+            is_running: false,
+            log
         }
     }
 }
@@ -600,7 +636,12 @@ fn connect_loop(
     Delay::new(Instant::now() + delay)
     .and_then(move |_| {
         info!(log, "Connecting to ZooKeeper cluster");
-        ZooKeeper::connect(&connect_string.to_string().parse().unwrap())
+        //
+        // We unwrap() the result of get_addr_at() because we anticipate the
+        // connect string having at least one element, and we can't do anything
+        // useful if it doesn't.
+        //
+        ZooKeeper::connect(connect_string.get_addr_at(0).unwrap())
         .and_then(move |(zk, default_watcher)| {
             info!(log, "Connected to ZooKeeper cluster");
 
