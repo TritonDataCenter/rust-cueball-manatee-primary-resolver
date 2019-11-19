@@ -29,14 +29,12 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use clap::{crate_name, crate_version};
 use failure::Error as FailureError;
 use futures::future::{ok, loop_fn, Either, Future, Loop};
 use itertools::Itertools;
 use serde_json;
 use serde_json::Value as SerdeJsonValue;
-use slog::{error, info, debug, o, Drain, Key, LevelFilter, Logger, Record,
-    Serializer};
+use slog::{error, info, debug, o, Drain, Key, Logger, Record, Serializer};
 use slog::Result as SlogResult;
 use slog::Value as SlogValue;
 use tokio_zookeeper::*;
@@ -250,27 +248,12 @@ impl ManateePrimaryResolver {
     {
         let cluster_state_path = [&path, "/state"].concat();
 
-        let log_values = o!(
-            "build-id" => crate_version!(),
-            "connect_string" => LogItem(connect_string.to_string()),
-            "path" => cluster_state_path.clone()
-        );
-
         //
         // Add the log_values to the passed-in logger, or create a new logger if
         // the caller did not pass one in
         //
-        let log = match log {
-            Some(log) => log.new(log_values),
-            None => Logger::root(
-                Mutex::new(LevelFilter::new(
-                    slog_bunyan::with_name(crate_name!(),
-                        std::io::stdout()).build(),
-                    slog::Level::Info,
-                )).fuse(),
-                log_values
-            )
-        };
+        let log = log.unwrap_or_else(||
+            Logger::root(slog_stdlog::StdLog.fuse(), o!()));
 
         ManateePrimaryResolver {
             connect_string: connect_string.clone(),
@@ -849,7 +832,9 @@ mod test {
     use std::sync::mpsc::{channel, TryRecvError};
     use std::vec::Vec;
 
+    use clap::{crate_name, crate_version};
     use quickcheck::{quickcheck, Arbitrary, Gen};
+    use slog::LevelFilter;
 
     use super::util;
 
@@ -890,7 +875,7 @@ mod test {
             Mutex::new(LevelFilter::new(
                 slog_bunyan::with_name(crate_name!(),
                     std::io::stdout()).build(),
-                slog::Level::Critical)).fuse(),
+                slog::Level::Trace)).fuse(),
                 o!("build-id" => crate_version!()))
     }
 
