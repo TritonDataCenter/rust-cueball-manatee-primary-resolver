@@ -32,6 +32,7 @@ use std::time::{Duration, Instant};
 use failure::Error as FailureError;
 use futures::future::{ok, loop_fn, Either, Future, Loop};
 use itertools::Itertools;
+use serde::Deserialize;
 use serde_json;
 use serde_json::Value as SerdeJsonValue;
 use slog::{error, info, debug, o, Drain, Key, Logger, Record, Serializer};
@@ -117,7 +118,7 @@ impl From<AddrParseError> for ZkConnectStringError {
 ///
 /// `ZkConnectString` represents a list of zookeeper addresses to connect to.
 ///
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct ZkConnectString(Vec<SocketAddr>);
 
 impl ZkConnectString {
@@ -620,11 +621,12 @@ fn connect_loop(
     .and_then(move |_| {
         info!(log, "Connecting to ZooKeeper cluster");
         //
-        // We unwrap() the result of get_addr_at() because we anticipate the
+        // We expect() the result of get_addr_at() because we anticipate the
         // connect string having at least one element, and we can't do anything
         // useful if it doesn't.
         //
-        ZooKeeper::connect(connect_string.get_addr_at(0).unwrap())
+        ZooKeeper::connect(connect_string.get_addr_at(0)
+        .expect("connect_string should have at least one IP address"))
         .and_then(move |(zk, default_watcher)| {
             info!(log, "Connected to ZooKeeper cluster");
 
