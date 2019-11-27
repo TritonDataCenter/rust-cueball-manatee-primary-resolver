@@ -23,7 +23,7 @@
 use std::convert::From;
 use std::fmt::Debug;
 use std::net::{AddrParseError, SocketAddr};
-use std::str::{FromStr};
+use std::str::FromStr;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -825,6 +825,11 @@ impl Resolver for ManateePrimaryResolver {
 //
 // Unit tests
 //
+// The "." path attribute below is so paths within the `test` submodule will be
+// relative to "src" rather than "src/test", which does not exist. This allows
+// us to import the "../tests/test_data.rs" module here.
+//
+#[path = "."]
 #[cfg(test)]
 mod test {
     use super::*;
@@ -839,6 +844,10 @@ mod test {
     use slog::LevelFilter;
 
     use super::util;
+    // use super::test_data;
+
+    #[path = "../tests/test_data.rs"]
+    mod test_data;
 
     impl Arbitrary for ZkConnectString {
         fn arbitrary<G: Gen>(g: &mut G) -> Self {
@@ -881,316 +890,6 @@ mod test {
                 o!("build-id" => crate_version!()))
     }
 
-    #[derive(Clone)]
-    struct BackendData {
-        raw: Vec<u8>,
-        object: Backend
-    }
-
-    impl BackendData {
-        //
-        // Most of the data here isn't relevant, but real json from zookeeper
-        // will include it, so we include it here.
-        //
-        fn new(ip: &str, port: u16) -> Self {
-            let raw = format!(r#" {{
-                "generation": 1,
-                "primary": {{
-                    "id": "{ip}:{port}:12345",
-                    "ip": "{ip}",
-                    "pgUrl": "tcp://postgres@{ip}:{port}/postgres",
-                    "zoneId": "f47c4766-1857-4bdc-97f0-c1fd009c955b",
-                    "backupUrl": "http://{ip}:12345"
-                }},
-                "sync": {{
-                    "id": "10.77.77.21:5432:12345",
-                    "zoneId": "f8727df9-c639-4152-a861-c77a878ca387",
-                    "ip": "10.77.77.21",
-                    "pgUrl": "tcp://postgres@10.77.77.21:5432/postgres",
-                    "backupUrl": "http://10.77.77.21:12345"
-                }},
-                "async": [],
-                "deposed": [
-                    {{
-                        "id":"10.77.77.22:5432:12345",
-                        "ip": "10.77.77.22",
-                        "pgUrl": "tcp://postgres@10.77.77.22:5432/postgres",
-                        "zoneId": "c7a64f9f-4d49-4e6b-831a-68fd6ebf1d3c",
-                        "backupUrl": "http://10.77.77.22:12345"
-                    }}
-                ],
-                "initWal": "0/16522D8"
-            }}"#, ip = ip, port = port).as_bytes().to_vec();
-
-            BackendData {
-                raw,
-                object: Backend::new(&BackendAddress::from_str(ip).unwrap(),
-                    port)
-            }
-        }
-
-        fn raw(&self) -> Vec<u8> {
-            self.raw.clone()
-        }
-
-        fn key(&self) -> BackendKey {
-            srv_key(&self.object)
-        }
-
-        fn added_msg(&self) -> BackendAddedMsg {
-            BackendAddedMsg {
-                key: self.key(),
-                backend: self.object.clone()
-            }
-        }
-
-        fn removed_msg(&self) -> BackendRemovedMsg {
-            BackendRemovedMsg(self.key())
-        }
-    }
-
-    fn backend_ip1_port1() -> BackendData {
-        BackendData::new("10.77.77.28", 5432)
-    }
-
-    fn backend_ip1_port2() -> BackendData {
-        BackendData::new("10.77.77.28", 5431)
-    }
-
-    fn backend_ip2_port1() -> BackendData {
-        BackendData::new("10.77.77.21", 5432)
-    }
-
-    fn backend_ip2_port2() -> BackendData {
-        BackendData::new("10.77.77.21", 5431)
-    }
-
-    fn raw_invalid_json() -> Vec<u8> {
-        "foo".as_bytes().to_vec()
-    }
-
-    fn raw_no_ip() -> Vec<u8> {
-        r#" {
-                "generation": 1,
-                "primary": {
-                    "id": "10.77.77.21:5432:12345",
-                    "zoneId": "f8727df9-c639-4152-a861-c77a878ca387",
-                    "pgUrl": "tcp://postgres@10.77.77.21:5432/postgres",
-                    "backupUrl": "http://10.77.77.21:12345"
-                },
-                "sync": {
-                    "id": "10.77.77.28:5432:12345",
-                    "ip": "10.77.77.28",
-                    "pgUrl": "tcp://postgres@10.77.77.28:5432/postgres",
-                    "zoneId": "f47c4766-1857-4bdc-97f0-c1fd009c955b",
-                    "backupUrl": "http://10.77.77.28:12345"
-                },
-                "async": [],
-                "deposed": [
-                    {
-                        "id":"10.77.77.22:5432:12345",
-                        "ip": "10.77.77.22",
-                        "pgUrl": "tcp://postgres@10.77.77.22:5432/postgres",
-                        "zoneId": "c7a64f9f-4d49-4e6b-831a-68fd6ebf1d3c",
-                        "backupUrl": "http://10.77.77.22:12345"
-                    }
-                ],
-                "initWal": "0/16522D8"
-            }
-        "#.as_bytes().to_vec()
-    }
-
-    fn raw_invalid_ip() -> Vec<u8> {
-        r#" {
-                "generation": 1,
-                "primary": {
-                    "id": "10.77.77.21:5432:12345",
-                    "zoneId": "f8727df9-c639-4152-a861-c77a878ca387",
-                    "ip": "foo",
-                    "pgUrl": "tcp://postgres@10.77.77.21:5432/postgres",
-                    "backupUrl": "http://10.77.77.21:12345"
-                },
-                "sync": {
-                    "id": "10.77.77.28:5432:12345",
-                    "ip": "10.77.77.28",
-                    "pgUrl": "tcp://postgres@10.77.77.28:5432/postgres",
-                    "zoneId": "f47c4766-1857-4bdc-97f0-c1fd009c955b",
-                    "backupUrl": "http://10.77.77.28:12345"
-                },
-                "async": [],
-                "deposed": [
-                    {
-                        "id":"10.77.77.22:5432:12345",
-                        "ip": "10.77.77.22",
-                        "pgUrl": "tcp://postgres@10.77.77.22:5432/postgres",
-                        "zoneId": "c7a64f9f-4d49-4e6b-831a-68fd6ebf1d3c",
-                        "backupUrl": "http://10.77.77.22:12345"
-                    }
-                ],
-                "initWal": "0/16522D8"
-            }
-        "#.as_bytes().to_vec()
-    }
-
-    fn raw_wrong_type_ip() -> Vec<u8> {
-        r#" {
-                "generation": 1,
-                "primary": {
-                    "id": "10.77.77.21:5432:12345",
-                    "zoneId": "f8727df9-c639-4152-a861-c77a878ca387",
-                    "ip": true,
-                    "pgUrl": "tcp://postgres@10.77.77.21:5432/postgres",
-                    "backupUrl": "http://10.77.77.21:12345"
-                },
-                "sync": {
-                    "id": "10.77.77.28:5432:12345",
-                    "ip": "10.77.77.28",
-                    "pgUrl": "tcp://postgres@10.77.77.28:5432/postgres",
-                    "zoneId": "f47c4766-1857-4bdc-97f0-c1fd009c955b",
-                    "backupUrl": "http://10.77.77.28:12345"
-                },
-                "async": [],
-                "deposed": [
-                    {
-                        "id":"10.77.77.22:5432:12345",
-                        "ip": "10.77.77.22",
-                        "pgUrl": "tcp://postgres@10.77.77.22:5432/postgres",
-                        "zoneId": "c7a64f9f-4d49-4e6b-831a-68fd6ebf1d3c",
-                        "backupUrl": "http://10.77.77.22:12345"
-                    }
-                ],
-                "initWal": "0/16522D8"
-            }
-        "#.as_bytes().to_vec()
-    }
-
-    fn raw_no_pg_url() -> Vec<u8> {
-        r#" {
-                "generation": 1,
-                "primary": {
-                    "id": "10.77.77.28:5432:12345",
-                    "ip": "10.77.77.28",
-                    "zoneId": "f47c4766-1857-4bdc-97f0-c1fd009c955b",
-                    "backupUrl": "http://10.77.77.28:12345"
-                },
-                "sync": {
-                    "id": "10.77.77.21:5432:12345",
-                    "zoneId": "f8727df9-c639-4152-a861-c77a878ca387",
-                    "ip": "10.77.77.21",
-                    "pgUrl": "tcp://postgres@10.77.77.21:5432/postgres",
-                    "backupUrl": "http://10.77.77.21:12345"
-                },
-                "async": [],
-                "deposed": [
-                    {
-                        "id":"10.77.77.22:5432:12345",
-                        "ip": "10.77.77.22",
-                        "pgUrl": "tcp://postgres@10.77.77.22:5432/postgres",
-                        "zoneId": "c7a64f9f-4d49-4e6b-831a-68fd6ebf1d3c",
-                        "backupUrl": "http://10.77.77.22:12345"
-                    }
-                ],
-                "initWal": "0/16522D8"
-            }
-        "#.as_bytes().to_vec()
-    }
-
-    fn raw_invalid_pg_url() -> Vec<u8> {
-        r#" {
-                "generation": 1,
-                "primary": {
-                    "id": "10.77.77.28:5432:12345",
-                    "ip": "10.77.77.28",
-                    "pgUrl": "foo",
-                    "zoneId": "f47c4766-1857-4bdc-97f0-c1fd009c955b",
-                    "backupUrl": "http://10.77.77.28:12345"
-                },
-                "sync": {
-                    "id": "10.77.77.21:5432:12345",
-                    "zoneId": "f8727df9-c639-4152-a861-c77a878ca387",
-                    "ip": "10.77.77.21",
-                    "pgUrl": "tcp://postgres@10.77.77.21:5432/postgres",
-                    "backupUrl": "http://10.77.77.21:12345"
-                },
-                "async": [],
-                "deposed": [
-                    {
-                        "id":"10.77.77.22:5432:12345",
-                        "ip": "10.77.77.22",
-                        "pgUrl": "tcp://postgres@10.77.77.22:5432/postgres",
-                        "zoneId": "c7a64f9f-4d49-4e6b-831a-68fd6ebf1d3c",
-                        "backupUrl": "http://10.77.77.22:12345"
-                    }
-                ],
-                "initWal": "0/16522D8"
-            }
-        "#.as_bytes().to_vec()
-    }
-
-    fn raw_wrong_type_pg_url() -> Vec<u8> {
-        r#" {
-                "generation": 1,
-                "primary": {
-                    "id": "10.77.77.28:5432:12345",
-                    "ip": "10.77.77.28",
-                    "pgUrl": true,
-                    "zoneId": "f47c4766-1857-4bdc-97f0-c1fd009c955b",
-                    "backupUrl": "http://10.77.77.28:12345"
-                },
-                "sync": {
-                    "id": "10.77.77.21:5432:12345",
-                    "zoneId": "f8727df9-c639-4152-a861-c77a878ca387",
-                    "ip": "10.77.77.21",
-                    "pgUrl": "tcp://postgres@10.77.77.21:5432/postgres",
-                    "backupUrl": "http://10.77.77.21:12345"
-                },
-                "async": [],
-                "deposed": [
-                    {
-                        "id":"10.77.77.22:5432:12345",
-                        "ip": "10.77.77.22",
-                        "pgUrl": "tcp://postgres@10.77.77.22:5432/postgres",
-                        "zoneId": "c7a64f9f-4d49-4e6b-831a-68fd6ebf1d3c",
-                        "backupUrl": "http://10.77.77.22:12345"
-                    }
-                ],
-                "initWal": "0/16522D8"
-            }
-        "#.as_bytes().to_vec()
-    }
-
-    fn raw_no_port_pg_url() -> Vec<u8> {
-        r#" {
-                "generation": 1,
-                "primary": {
-                    "id": "10.77.77.28:5432:12345",
-                    "ip": "10.77.77.28",
-                    "pgUrl": "tcp://postgres@10.77.77.22/postgres",
-                    "zoneId": "f47c4766-1857-4bdc-97f0-c1fd009c955b",
-                    "backupUrl": "http://10.77.77.28:12345"
-                },
-                "sync": {
-                    "id": "10.77.77.21:5432:12345",
-                    "zoneId": "f8727df9-c639-4152-a861-c77a878ca387",
-                    "ip": "10.77.77.21",
-                    "pgUrl": "tcp://postgres@10.77.77.21:5432/postgres",
-                    "backupUrl": "http://10.77.77.21:12345"
-                },
-                "async": [],
-                "deposed": [
-                    {
-                        "id":"10.77.77.22:5432:12345",
-                        "ip": "10.77.77.22",
-                        "pgUrl": "tcp://postgres@10.77.77.22:5432/postgres",
-                        "zoneId": "c7a64f9f-4d49-4e6b-831a-68fd6ebf1d3c",
-                        "backupUrl": "http://10.77.77.22:12345"
-                    }
-                ],
-                "initWal": "0/16522D8"
-            }
-        "#.as_bytes().to_vec()
-    }
-
     //
     // Represents a process_value test case, including inputs and expected
     // outputs.
@@ -1199,7 +898,6 @@ mod test {
         value: Vec<u8>,
         last_backend: BackendKey,
         expected_error: Option<ResolverError>,
-        message_count: u32,
         added_backend: Option<BackendAddedMsg>,
         removed_backend: Option<BackendRemovedMsg>
     }
@@ -1225,8 +923,19 @@ mod test {
 
         let mut received_messages = Vec::new();
 
+        let expected_message_count = {
+            let mut acc = 0;
+            if input.added_backend.is_some() {
+                acc += 1;
+            }
+            if input.removed_backend.is_some() {
+                acc += 1;
+            }
+            acc
+        };
+
         // Receive as many messages as we expect
-        for i in 0..input.message_count {
+        for i in 0..expected_message_count {
             let channel_result = rx.try_recv();
             match channel_result {
                 Err(e) => panic!("Unexpected error receiving on channel: {:?} \
@@ -1274,14 +983,13 @@ mod test {
 
     #[test]
     fn port_ip_change_test() {
-        let data_1 = backend_ip1_port1();
-        let data_2 = backend_ip2_port2();
+        let data_1 = test_data::backend_ip1_port1();
+        let data_2 = test_data::backend_ip2_port2();
 
         run_process_value_fields(ProcessValueFields{
-            value: data_2.raw(),
+            value: data_2.raw_vec(),
             last_backend: data_1.key(),
             expected_error: None,
-            message_count: 2,
             added_backend: Some(data_2.added_msg()),
             removed_backend: Some(data_1.removed_msg())
         });
@@ -1289,14 +997,13 @@ mod test {
 
     #[test]
     fn port_change_test() {
-        let data_1 = backend_ip1_port1();
-        let data_2 = backend_ip2_port1();
+        let data_1 = test_data::backend_ip1_port1();
+        let data_2 = test_data::backend_ip2_port1();
 
         run_process_value_fields(ProcessValueFields{
-            value: data_2.raw(),
+            value: data_2.raw_vec(),
             last_backend: data_1.key(),
             expected_error: None,
-            message_count: 2,
             added_backend: Some(data_2.added_msg()),
             removed_backend: Some(data_1.removed_msg())
         });
@@ -1304,14 +1011,13 @@ mod test {
 
     #[test]
     fn ip_change_test() {
-        let data_1 = backend_ip1_port1();
-        let data_2 = backend_ip1_port2();
+        let data_1 = test_data::backend_ip1_port1();
+        let data_2 = test_data::backend_ip1_port2();
 
         run_process_value_fields(ProcessValueFields{
-            value: data_2.raw(),
+            value: data_2.raw_vec(),
             last_backend: data_1.key(),
             expected_error: None,
-            message_count: 2,
             added_backend: Some(data_2.added_msg()),
             removed_backend: Some(data_1.removed_msg())
         });
@@ -1319,13 +1025,12 @@ mod test {
 
     #[test]
     fn no_change_test() {
-        let data = backend_ip1_port1();
+        let data = test_data::backend_ip1_port1();
 
         run_process_value_fields(ProcessValueFields{
-            value: data.raw(),
+            value: data.raw_vec(),
             last_backend: data.key(),
             expected_error: None,
-            message_count: 0,
             added_backend: None,
             removed_backend: None
         });
@@ -1333,13 +1038,12 @@ mod test {
 
     #[test]
     fn no_ip_test() {
-        let filler = backend_ip1_port1();
+        let filler = test_data::backend_ip1_port1();
 
         run_process_value_fields(ProcessValueFields{
-            value: raw_no_ip(),
+            value: test_data::no_ip_vec(),
             last_backend: filler.key(),
             expected_error: Some(ResolverError::MissingZkData(ZkDataField::Ip)),
-            message_count: 0,
             added_backend: None,
             removed_backend: None
         });
@@ -1347,13 +1051,12 @@ mod test {
 
     #[test]
     fn wrong_type_ip_test() {
-        let filler = backend_ip1_port1();
+        let filler = test_data::backend_ip1_port1();
 
         run_process_value_fields(ProcessValueFields{
-            value: raw_wrong_type_ip(),
+            value: test_data::wrong_type_ip_vec(),
             last_backend: filler.key(),
             expected_error: Some(ResolverError::InvalidZkData(ZkDataField::Ip)),
-            message_count: 0,
             added_backend: None,
             removed_backend: None
         });
@@ -1361,13 +1064,12 @@ mod test {
 
     #[test]
     fn invalid_ip_test() {
-        let filler = backend_ip1_port1();
+        let filler = test_data::backend_ip1_port1();
 
         run_process_value_fields(ProcessValueFields{
-            value: raw_invalid_ip(),
+            value: test_data::invalid_ip_vec(),
             last_backend: filler.key(),
             expected_error: Some(ResolverError::InvalidZkData(ZkDataField::Ip)),
-            message_count: 0,
             added_backend: None,
             removed_backend: None
         });
@@ -1375,14 +1077,13 @@ mod test {
 
     #[test]
     fn no_pg_url_test() {
-        let filler = backend_ip1_port1();
+        let filler = test_data::backend_ip1_port1();
 
         run_process_value_fields(ProcessValueFields{
-            value: raw_no_pg_url(),
+            value: test_data::no_pg_url_vec(),
             last_backend: filler.key(),
             expected_error: Some(ResolverError::MissingZkData(
                 ZkDataField::PostgresUrl)),
-            message_count: 0,
             added_backend: None,
             removed_backend: None
         });
@@ -1390,14 +1091,13 @@ mod test {
 
     #[test]
     fn wrong_type_pg_url_test() {
-        let filler = backend_ip1_port1();
+        let filler = test_data::backend_ip1_port1();
 
         run_process_value_fields(ProcessValueFields{
-            value: raw_wrong_type_pg_url(),
+            value: test_data::wrong_type_pg_url_vec(),
             last_backend: filler.key(),
             expected_error: Some(ResolverError::InvalidZkData(
                 ZkDataField::PostgresUrl)),
-            message_count: 0,
             added_backend: None,
             removed_backend: None
         });
@@ -1405,14 +1105,13 @@ mod test {
 
     #[test]
     fn invalid_pg_url_test() {
-        let filler = backend_ip1_port1();
+        let filler = test_data::backend_ip1_port1();
 
         run_process_value_fields(ProcessValueFields{
-            value: raw_invalid_pg_url(),
+            value: test_data::invalid_pg_url_vec(),
             last_backend: filler.key(),
             expected_error: Some(ResolverError::InvalidZkData(
                 ZkDataField::PostgresUrl)),
-            message_count: 0,
             added_backend: None,
             removed_backend: None
         });
@@ -1420,14 +1119,13 @@ mod test {
 
     #[test]
     fn no_port_pg_url_test() {
-        let filler = backend_ip1_port1();
+        let filler = test_data::backend_ip1_port1();
 
         run_process_value_fields(ProcessValueFields{
-            value: raw_no_port_pg_url(),
+            value: test_data::no_port_pg_url_vec(),
             last_backend: filler.key(),
             expected_error: Some(ResolverError::MissingZkData(
                 ZkDataField::Port)),
-            message_count: 0,
             added_backend: None,
             removed_backend: None
         });
@@ -1435,13 +1133,12 @@ mod test {
 
     #[test]
     fn invalid_json_test() {
-        let filler = backend_ip1_port1();
+        let filler = test_data::backend_ip1_port1();
 
         run_process_value_fields(ProcessValueFields{
-            value: raw_invalid_json(),
+            value: test_data::invalid_json_vec(),
             last_backend: filler.key(),
             expected_error: Some(ResolverError::InvalidZkJson),
-            message_count: 0,
             added_backend: None,
             removed_backend: None
         });
