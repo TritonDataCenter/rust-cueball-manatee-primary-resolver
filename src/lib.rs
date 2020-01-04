@@ -29,19 +29,32 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use clap::{crate_name, crate_version};
 use failure::Error as FailureError;
 use futures::future::{ok, loop_fn, Either, Future, Loop};
 use itertools::Itertools;
 use serde::Deserialize;
 use serde_json;
 use serde_json::Value as SerdeJsonValue;
-use slog::{error, info, debug, o, Drain, Key, Logger, Record, Serializer};
+use slog::{
+    error,
+    info,
+    debug,
+    o,
+    Drain,
+    Key,
+    LevelFilter,
+    Logger,
+    Record,
+    Serializer
+};
 use slog::Result as SlogResult;
 use slog::Value as SlogValue;
 use tokio_zookeeper::*;
 use tokio::prelude::*;
 use tokio::runtime::Runtime;
 use tokio::timer::Delay;
+use tokio::timer::timeout::Error as TimeoutError;
 use url::Url;
 
 use cueball::backend::*;
@@ -56,21 +69,34 @@ pub mod util;
 
 //
 // The interval at which the resolver should send heartbeats via the
-// connection pool channel.
+// connection pool channel. Public for use in tests.
 //
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 
 //
-// Delays to be used when reconnecting to the zookeeper client
+// Timeout for zookeeper sessions. Public for use in tests.
 //
-const RECONNECT_DELAY: Duration = Duration::from_secs(10);
-const RECONNECT_NODELAY: Duration = Duration::from_secs(0);
+pub const SESSION_TIMEOUT: Duration = Duration::from_secs(5);
 
 //
-// Delays to be used when re-setting the watch on the zookeeper node
+// Timeout for the initial tcp connect operation to zookeeper. Public for use in
+// tests.
 //
-const WATCH_LOOP_DELAY: Duration = Duration::from_secs(10);
-const WATCH_LOOP_NODELAY: Duration = Duration::from_secs(0);
+pub const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+//
+// Delays to be used when reconnecting to the zookeeper client. Public for use
+// in tests.
+//
+pub const RECONNECT_DELAY: Duration = Duration::from_secs(10);
+pub const RECONNECT_NODELAY: Duration = Duration::from_secs(0);
+
+//
+// Delays to be used when re-setting the watch on the zookeeper node. Public for
+// use in tests.
+//
+pub const WATCH_LOOP_DELAY: Duration = Duration::from_secs(10);
+pub const WATCH_LOOP_NODELAY: Duration = Duration::from_secs(0);
 
 //
 // An error type to be used internally.
@@ -223,7 +249,7 @@ pub struct ManateePrimaryResolver {
     /// call to run(), and false otherwise), but could be useful if the caller
     /// wants to check if the resolver is running for some reason.
     ///
-    is_running: bool,
+    pub is_running: bool,
     ///
     /// The ManateePrimaryResolver's root log
     ///
@@ -253,8 +279,13 @@ impl ManateePrimaryResolver {
         // Add the log_values to the passed-in logger, or create a new logger if
         // the caller did not pass one in
         //
-        let log = log.unwrap_or_else(||
-            Logger::root(slog_stdlog::StdLog.fuse(), o!()));
+        let log = log.unwrap_or_else(|| {
+            Logger::root(Mutex::new(LevelFilter::new(
+                slog_bunyan::with_name(crate_name!(),
+                    std::io::stdout()).build(),
+                slog::Level::Info)).fuse(),
+                o!("build-id" => crate_version!()))
+        });
 
         ManateePrimaryResolver {
             connect_string: connect_string.clone(),
@@ -617,16 +648,25 @@ fn connect_loop(
     Error = ()> + Send {
 
     let oe_log = log.clone();
+
     Delay::new(Instant::now() + delay)
     .and_then(move |_| {
         info!(log, "Connecting to ZooKeeper cluster");
+
+        let mut builder = ZooKeeperBuilder::default();
+        builder.set_timeout(SESSION_TIMEOUT);
+        builder.set_logger(log.new(o!(
+            "component" => "zookeeper"
+        )));
+
         //
         // We expect() the result of get_addr_at() because we anticipate the
         // connect string having at least one element, and we can't do anything
         // useful if it doesn't.
         //
-        ZooKeeper::connect(connect_string.get_addr_at(0)
-        .expect("connect_string should have at least one IP address"))
+        builder.connect(connect_string.get_addr_at(0)
+            .expect("connect_string should have at least one IP address"))
+        .timeout(TCP_CONNECT_TIMEOUT)
         .and_then(move |(zk, default_watcher)| {
             info!(log, "Connected to ZooKeeper cluster");
 
@@ -684,6 +724,7 @@ fn connect_loop(
                     loop_state,
                     log
                 )
+                .map_err(|err| TimeoutError::inner(err))
             })
             .and_then(|next_action| {
                 ok(match next_action {
@@ -703,6 +744,7 @@ fn connect_loop(
         .or_else(move |error| {
             error!(oe_log, "Error connecting to ZooKeeper cluster";
                 "error" => LogItem(error));
+
             ok(Loop::Continue(RECONNECT_DELAY))
         })
     })
@@ -761,6 +803,9 @@ impl Resolver for ManateePrimaryResolver {
         let log = self.log.clone();
         let at_log = self.log.clone();
 
+        let exited = Arc::new(Mutex::new(false));
+        let exited_clone = Arc::clone(&exited);
+
         //
         // Start the event-processing task. This is structured as two nested
         // loops: one to handle the zookeeper connection and one to handle
@@ -780,7 +825,7 @@ impl Resolver for ManateePrimaryResolver {
             //     connecting.
             // Loop::Break type: ()
             //
-            loop_fn(Duration::from_secs(0), move |delay| {
+            loop_fn(RECONNECT_NODELAY, move |delay| {
                 let pool_tx = pool_tx.clone();
                 let last_backend = Arc::clone(&last_backend);
                 let connect_string = connect_string.clone();
@@ -797,11 +842,25 @@ impl Resolver for ManateePrimaryResolver {
                 )
             }).and_then(move |_| {
                 info!(at_log, "Event-processing task stopping");
+                *exited_clone.lock().unwrap() = true;
                 Ok(())
             })
             .map(|_| ())
+            .map_err(|_| {
+                unreachable!("connect_loop() should never return an error")
+            })
         );
+
+        //
+        // Heartbeat-sending loop. If we break from this loop, the resolver
+        // exits.
+        //
         loop {
+            if *exited.lock().unwrap() {
+                info!(self.log,
+                    "event-processing task exited; stopping heartbeats");
+                break;
+            }
             if s.send(BackendMsg::HeartbeatMsg).is_err() {
                 info!(self.log, "Connection pool channel closed");
                 break;
@@ -839,7 +898,6 @@ mod test {
     use std::sync::mpsc::{channel, TryRecvError};
     use std::vec::Vec;
 
-    use clap::{crate_name, crate_version};
     use quickcheck::{quickcheck, Arbitrary, Gen};
     use slog::LevelFilter;
 
