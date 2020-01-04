@@ -47,13 +47,6 @@ enum ZkStatus {
 pub mod util;
 pub mod test_data;
 
-fn default_test_context() -> TestRunner {
-    let connect_string = ZkConnectString::from_str(
-         "127.0.0.1:2181").unwrap();
-    let root_path = "/test-".to_string() + &Uuid::new_v4().to_string();
-    TestRunner::new(connect_string, root_path)
-}
-
 fn toggle_zookeeper(status: ZkStatus) {
     const SVCADM_PATH: &str = "/usr/sbin/svcadm";
     const SVCADM_ZOOKEEPER_SERVICE_NAME: &str = "zookeeper";
@@ -194,7 +187,7 @@ fn test_start_with_unreachable_zookeeper() {
 
     let (tx, rx) = channel();
 
-    let mut ctx = default_test_context();
+    let mut ctx = TestRunner::default();
 
     let connect_string_resolver = ctx.connect_string.clone();
     let root_path_resolver = ctx.root_path.clone();
@@ -230,11 +223,12 @@ fn test_start_with_unreachable_zookeeper() {
 #[test]
 fn test_reconnect_after_zk_hiccup() {
 
-    // toggle_zookeeper(ZkStatus::Enabled);
+    toggle_zookeeper(ZkStatus::Enabled);
 
     let (tx, rx) = channel();
 
-    let mut ctx = default_test_context();
+    let mut ctx = TestRunner::default();
+    ctx.setup_zk_nodes();
 
     let connect_string_resolver = ctx.connect_string.clone();
     let root_path_resolver = ctx.root_path.clone();
@@ -269,4 +263,7 @@ fn test_reconnect_after_zk_hiccup() {
 
     assert!(util::resolver_connected(&mut ctx, &rx),
         "Resolver should be connected to Zookeeper");
+
+    ctx.teardown_zk_nodes();
+    ctx.finalize();
 }

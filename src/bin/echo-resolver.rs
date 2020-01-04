@@ -32,6 +32,11 @@ use cueball_manatee_primary_resolver::{
     ZkConnectString
 };
 
+// TODO remove this once done testing
+#[path = "../../tests/util.rs"]
+mod util;
+use util::{TestRunner};
+
 fn parse_log_level(s: String) -> Result<Level, String> {
     match s.as_str() {
        "trace" => Ok(Level::Trace),
@@ -87,7 +92,6 @@ fn main() {
 }
 
 fn run(s: ZkConnectString, p: String, l: Level) -> Result<(), String> {
-
     let log = Logger::root(
         Mutex::new(LevelFilter::new(
             slog_bunyan::with_name(crate_name!(),
@@ -96,12 +100,16 @@ fn run(s: ZkConnectString, p: String, l: Level) -> Result<(), String> {
             o!("build-id" => crate_version!()));
 
     let (tx, rx) = channel();
+    let mut ctx = TestRunner::new(s.clone(), p.clone());
 
     let resolver_thread = thread::spawn(move || {
         let mut resolver = ManateePrimaryResolver::new(s,
             p, Some(log));
         resolver.run(tx);
     });
+
+
+    println!("{:?}", util::resolver_connected(&mut ctx, &rx));
 
     loop {
         match rx.recv() {

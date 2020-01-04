@@ -20,7 +20,8 @@ tokio = "0.1.22"
 tokio-zookeeper = { path = "../tokio-zookeeper" }
 unicode-normalization = "=0.1.5"
 url = "2.1.0"
+# TODO move uuid back to dev-dependencies after done testing
+uuid = { version = "0.8", features = ["v4"] }
 
 [dev-dependencies]
 quickcheck = "0.8.0"
-uuid = { version = "0.8", features = ["v4"] }

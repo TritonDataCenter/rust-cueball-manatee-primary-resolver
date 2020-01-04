@@ -1,3 +1,4 @@
+use std::default::Default;
 use std::env;
 use std::fmt::{Debug, Display};
 use std::io::Error as IoError;
@@ -66,6 +67,15 @@ pub struct TestRunner {
     rt: Runtime,
 }
 
+impl Default for TestRunner {
+    fn default() -> Self {
+        let connect_string = ZkConnectString::from_str(
+             "127.0.0.1:2181").unwrap();
+        let root_path = "/test-".to_string() + &Uuid::new_v4().to_string();
+        TestRunner::new(connect_string, root_path)
+    }
+}
+
 impl TestRunner{
     pub fn new(
         connect_string: ZkConnectString,
@@ -81,7 +91,7 @@ impl TestRunner{
     // TODO proper error-handling and cleanup on failure
     // TODO refactor duplicate code
 
-    fn setup_zk_nodes(&mut self) {
+    pub fn setup_zk_nodes(&mut self) {
         let root_path = self.root_path.clone();
         let data_path = root_path.clone() + "/state";
         // TODO I don't think errors in calls to this function
@@ -90,7 +100,7 @@ impl TestRunner{
         self.set_zk_data(data_path, Vec::new());
     }
 
-    fn teardown_zk_nodes(&mut self) {
+    pub fn teardown_zk_nodes(&mut self) {
         let root_path = self.root_path.clone();
         let data_path = root_path.clone() + "/state";
 
@@ -99,7 +109,7 @@ impl TestRunner{
         self.delete_zk_node(root_path);
     }
 
-    fn finalize(self) {
+    pub fn finalize(self) {
         // Wait for the futures to resolve
         // TODO are they guaranteed to have all resolved already at this point?
         // TODO ^evidently not -- why does shutdown_on_idle block?
@@ -172,7 +182,7 @@ fn recv_timeout_discard_heartbeats(rx: &Receiver<BackendMsg>, timeout: Duration)
     Err(RecvTimeoutError::Timeout)
 }
 
-
+// This assumes that the "<root path>/state" node already exists. TODO enforce this
 pub fn resolver_connected(ctx: &mut TestRunner, rx: &Receiver<BackendMsg>) -> bool {
 
     // fn is_connection_error(err: FailureError) -> bool {
@@ -180,8 +190,6 @@ pub fn resolver_connected(ctx: &mut TestRunner, rx: &Receiver<BackendMsg>) -> bo
     //     // instead
     //     err.compat() == IoError::from_raw_os_error(146)
     // }
-
-    ctx.setup_zk_nodes();
 
     let data_path = ctx.root_path.clone() + "/state";
     let data_path_clone = data_path.clone();
@@ -207,14 +215,15 @@ pub fn resolver_connected(ctx: &mut TestRunner, rx: &Receiver<BackendMsg>) -> bo
     //
     ctx.set_zk_data(data_path_clone, test_data::backend_ip2_port2().raw_vec()).unwrap();
 
+    // TODO flush channel somehow? i.e. recv in a loop until error
     let channel_result =
             recv_timeout_discard_heartbeats(&rx, Duration::from_secs(2));
+
     //
     // Just verify that we receive some message. In other tests, we verify that
     // we receive exactly the messages we expect, so as long as we get
     // _something_, we know that the resolver is talking to the ZK server.
     //
-    ctx.teardown_zk_nodes();
     match channel_result {
         Ok(m) => {
             true
