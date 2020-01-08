@@ -1,3 +1,4 @@
+use std::convert::From;
 use std::default::Default;
 use std::env;
 use std::fmt::{Debug, Display};
@@ -42,46 +43,61 @@ use uuid::Uuid;
 #[path = "./test_data.rs"]
 mod test_data;
 
-macro_rules! clean_exit {
-    ($self:expr) => ({
-        $self.teardown_zk_nodes();
-        $self.finalize();
-        panic!()
-    });
-    ($self:expr, $msg:expr) => ({
-        $self.teardown_zk_nodes();
-        $self.finalize();
-        panic!($msg)
-    });
-    ($self:expr, $fmt:expr, $($arg:tt)+) => ({
-        $self.teardown_zk_nodes();
-        $self.finalize();
-        panic!($fmt, $($arg)+)
-    });
+// pub macro_rules! clean_exit {
+//     ($self:expr) => ({
+//         $self.teardown_zk_nodes();
+//         $self.finalize();
+//         panic!()
+//     });
+//     ($self:expr, $msg:expr) => ({
+//         $self.teardown_zk_nodes();
+//         $self.finalize();
+//         panic!($msg)
+//     });
+//     ($self:expr, $fmt:expr, $($arg:tt)+) => ({
+//         $self.teardown_zk_nodes();
+//         $self.finalize();
+//         panic!($fmt, $($arg)+)
+//     });
+// }
+
+// TODO impl From for various errors instead of converting manually in functions
+#[derive(Debug)]
+pub enum TestError {
+    RecvTimeout,
+    UnexpectedMessage,
+    BackendMismatch(String),
+    ZkError(String),
+    InvalidTimeout
 }
 
-// TODO rename to TestContext
-pub struct TestRunner {
+impl From<RecvTimeoutError> for TestError {
+    fn from(_: RecvTimeoutError) -> Self {
+        TestError::RecvTimeout
+    }
+}
+
+pub struct TestContext {
     pub connect_string: ZkConnectString,
     pub root_path: String,
     rt: Runtime,
 }
 
-impl Default for TestRunner {
+impl Default for TestContext {
     fn default() -> Self {
         let connect_string = ZkConnectString::from_str(
              "127.0.0.1:2181").unwrap();
         let root_path = "/test-".to_string() + &Uuid::new_v4().to_string();
-        TestRunner::new(connect_string, root_path)
+        TestContext::new(connect_string, root_path)
     }
 }
 
-impl TestRunner{
+impl TestContext{
     pub fn new(
         connect_string: ZkConnectString,
         root_path: String
     ) -> Self {
-        TestRunner{
+        TestContext{
             connect_string,
             root_path,
             rt: Runtime::new().unwrap(),
@@ -89,34 +105,36 @@ impl TestRunner{
     }
 
     // TODO proper error-handling and cleanup on failure
-    // TODO refactor duplicate code
 
-    pub fn setup_zk_nodes(&mut self) {
+    pub fn setup_zk_nodes(&mut self) -> Result<(), TestError> {
         let root_path = self.root_path.clone();
         let data_path = root_path.clone() + "/state";
         // TODO I don't think errors in calls to this function
         // get panicked upon
-        self.set_zk_data(root_path, Vec::new());
-        self.set_zk_data(data_path, Vec::new());
+        self.set_zk_data(root_path, Vec::new())?;
+        self.set_zk_data(data_path, Vec::new())?;
+        Ok(())
     }
 
-    pub fn teardown_zk_nodes(&mut self) {
+    pub fn teardown_zk_nodes(&mut self) -> Result<(), TestError> {
         let root_path = self.root_path.clone();
         let data_path = root_path.clone() + "/state";
 
         // The order here matters -- we must delete the child before the parent!
-        self.delete_zk_node(data_path);
-        self.delete_zk_node(root_path);
+        self.delete_zk_node(data_path)?;
+        self.delete_zk_node(root_path)?;
+        Ok(())
     }
 
     pub fn finalize(self) {
         // Wait for the futures to resolve
         // TODO are they guaranteed to have all resolved already at this point?
         // TODO ^evidently not -- why does shutdown_on_idle block?
+        // TODO should we unwrap or return an error here?
         self.rt.shutdown_now().wait().unwrap();
     }
 
-    fn set_zk_data(&mut self, path: String, data: Vec<u8>) -> Result<(), FailureError> {
+    fn set_zk_data(&mut self, path: String, data: Vec<u8>) -> Result<(), TestError> {
         self.rt.block_on(
             ZooKeeper::connect(&self.connect_string.to_string().parse().unwrap())
             .and_then(move |(zk, watcher)| {
@@ -141,10 +159,11 @@ impl TestRunner{
                     }
                 })
             })
+            .map_err(|e| TestError::ZkError(format!("{:?}", e)))
         )
     }
 
-    fn delete_zk_node(&mut self, path: String) {
+    fn delete_zk_node(&mut self, path: String) -> Result<(), TestError> {
         self.rt.block_on(
             ZooKeeper::connect(&self.connect_string.to_string().parse().unwrap())
             .and_then(move |(zk, watcher)| {
@@ -153,20 +172,20 @@ impl TestRunner{
                     None
                 )
             })
-        ).unwrap();
+            .map(|_| ())
+            .map_err(|e| TestError::ZkError(format!("{:?}", e)))
+        )
     }
 }
 
 fn recv_timeout_discard_heartbeats(rx: &Receiver<BackendMsg>, timeout: Duration)
-    -> Result<BackendMsg, RecvTimeoutError> {
+    -> Result<BackendMsg, TestError> {
 
     let start_time = Instant::now();
     let failsafe = Duration::from_secs(10);
 
     if timeout > failsafe {
-        // TODO make this a clean exit.
-        panic!("recv_timeout_discard_heartbeats called with timeout \
-            greater than failsafe");
+        return Err(TestError::InvalidTimeout);
     }
 
     // TODO this is wonky because if the timeout is less than the heartbeat
@@ -179,11 +198,12 @@ fn recv_timeout_discard_heartbeats(rx: &Receiver<BackendMsg>, timeout: Duration)
         }
     }
 
-    Err(RecvTimeoutError::Timeout)
+    Err(TestError::RecvTimeout)
 }
 
 // This assumes that the "<root path>/state" node already exists. TODO enforce this
-pub fn resolver_connected(ctx: &mut TestRunner, rx: &Receiver<BackendMsg>) -> bool {
+pub fn resolver_connected(ctx: &mut TestContext, rx: &Receiver<BackendMsg>)
+    -> Result<bool, TestError> {
 
     // fn is_connection_error(err: FailureError) -> bool {
     //     // TODO find where `146` is defined as ConnectionRefused and use that
@@ -205,7 +225,7 @@ pub fn resolver_connected(ctx: &mut TestRunner, rx: &Receiver<BackendMsg>) -> bo
     // difficult, because failure::Error doesn't really let you extract any
     // structured information that we can compare to a known entity.
     if let Err(_) = ctx.set_zk_data(data_path, test_data::backend_ip1_port1().raw_vec()) {
-        return false
+        return Ok(false);
     }
 
     //
@@ -213,7 +233,7 @@ pub fn resolver_connected(ctx: &mut TestRunner, rx: &Receiver<BackendMsg>) -> bo
     // succeeded, which means that zookeeper is running. Thus, we don't expect
     // the second call to set_zk_data() to error, and panic if it does.
     //
-    ctx.set_zk_data(data_path_clone, test_data::backend_ip2_port2().raw_vec()).unwrap();
+    ctx.set_zk_data(data_path_clone, test_data::backend_ip2_port2().raw_vec())?;
 
     // TODO flush channel somehow? i.e. recv in a loop until error
     let channel_result =
@@ -226,35 +246,43 @@ pub fn resolver_connected(ctx: &mut TestRunner, rx: &Receiver<BackendMsg>) -> bo
     //
     match channel_result {
         Ok(m) => {
-            true
+            Ok(true)
         },
         Err(e) => {
-            false
+            Ok(false)
         }
     }
 }
 
-// Consumes a TestRunner
-pub fn run_test_case(mut ctx: TestRunner, input: TestAction) {
+// Consumes a TestContext
+pub fn run_test_case(
+    ctx: &mut TestContext,
+    input: TestAction,
+    external_rx: Option<Receiver<BackendMsg>>
+) -> Result<(), TestError> {
     let data_path_start = ctx.root_path.clone() + "/state";
     let data_path_end = ctx.root_path.clone() + "/state";
     let start_data = input.start_data;
     let end_data = input.end_data;
 
-    let (tx, rx) = channel();
+    ctx.setup_zk_nodes()?;
 
-    ctx.setup_zk_nodes();
-
-    ctx.set_zk_data(data_path_start, start_data);
-
-    let connect_string = ctx.connect_string.clone();
-    let root_path_resolver = ctx.root_path.clone();
-    let tx_clone = tx.clone();
-    let resolver_thread = thread::spawn(move || {
-        let mut resolver = ManateePrimaryResolver::new(connect_string,
-            root_path_resolver, None);
-        resolver.run(tx_clone);
+    //
+    // Start a resolver if we didn't get an external rx
+    //
+    let rx = external_rx.unwrap_or_else(|| {
+        let (tx, rx) = channel();
+        let connect_string = ctx.connect_string.clone();
+        let root_path_resolver = ctx.root_path.clone();
+        let resolver_thread = thread::spawn(move || {
+            let mut resolver = ManateePrimaryResolver::new(connect_string,
+                root_path_resolver, None);
+            resolver.run(tx);
+        });
+        rx
     });
+
+    ctx.set_zk_data(data_path_start, start_data)?;
 
     //
     // We want this thread to not progress until the resolver_thread above
@@ -266,7 +294,7 @@ pub fn run_test_case(mut ctx: TestRunner, input: TestAction) {
     //
     thread::sleep(Duration::from_secs(2));
 
-    ctx.set_zk_data(data_path_end, end_data);
+    ctx.set_zk_data(data_path_end, end_data)?;
 
     //
     // The test runner starts out with no data at the zookeeper node. Thus,
@@ -276,15 +304,11 @@ pub fn run_test_case(mut ctx: TestRunner, input: TestAction) {
     // sure that the message is received as we expect. We do that here.
     //
     if let Some(msg) = input.added_start_backend {
-        let channel_result =
-            recv_timeout_discard_heartbeats(&rx, Duration::from_secs(2));
-        match channel_result {
-            Err(e) => clean_exit!(ctx, "Unexpected error receiving on channel: {:?}", e),
-            Ok(m) => {
-                if m != BackendMsg::AddedMsg(msg) {
-                    clean_exit!(ctx, "Message received does not match expected added_start_backend message")
-                }
-            }
+        let m = recv_timeout_discard_heartbeats(&rx, Duration::from_secs(2))?;
+        if m != BackendMsg::AddedMsg(msg) {
+            return Err(TestError::BackendMismatch(
+                "Message received does not match expected \
+                added_start_backend message".to_string()))
         }
     }
 
@@ -303,30 +327,25 @@ pub fn run_test_case(mut ctx: TestRunner, input: TestAction) {
 
     // Receive as many messages as we expect
     for i in 0..expected_message_count {
-        let channel_result =
-            recv_timeout_discard_heartbeats(&rx, Duration::from_secs(2));
-        match channel_result {
-            Err(e) => clean_exit!(ctx, "Unexpected error receiving on channel: {:?} -- Loop iteration: {:?}", e, i),
-            Ok(result) => {
-                received_messages.push(result);
-            }
-        }
+        let m = recv_timeout_discard_heartbeats(&rx, Duration::from_secs(2))?;
+        received_messages.push(m);
     }
 
+    // Make sure there are no more messages waiting
     // Can't use assert_eq! here because BackendMsg doesn't implement Debug
     match recv_timeout_discard_heartbeats(&rx, Duration::from_secs(2)) {
-        Err(RecvTimeoutError::Timeout) => (),
-        Err(e) => clean_exit!(ctx, "Unexpected error on resolver channel: {:?}", e),
-        _ => clean_exit!(ctx, "Unexpected message on resolver channel")
+        Err(TestError::RecvTimeout) => (),
+        Err(e) => return Err(e),
+        _ => return Err(TestError::UnexpectedMessage)
     }
 
     if let Some(msg) = input.added_backend {
         let msg = BackendMsg::AddedMsg(msg);
         match util::find_msg_match(&received_messages, &msg) {
-            None => clean_exit!(ctx, "added_backend not found in received messages"),
+            None => return Err(TestError::BackendMismatch(
+                "added_backend not found in received messages".to_string())),
             Some(index) => {
                 received_messages.remove(index);
-                ()
             }
         }
     }
@@ -334,20 +353,21 @@ pub fn run_test_case(mut ctx: TestRunner, input: TestAction) {
     if let Some(msg) = input.removed_backend {
         let msg = BackendMsg::RemovedMsg(msg);
         match util::find_msg_match(&received_messages, &msg) {
-            None => clean_exit!(ctx, "removed_backend not found in received messages"),
+            None => return Err(TestError::BackendMismatch(
+                "removed_backend not found in received messages".to_string())),
             Some(index) => {
                 received_messages.remove(index);
-                ()
             }
         }
     }
 
-    ctx.teardown_zk_nodes();
+    ctx.teardown_zk_nodes()?;
     // TODO get this function to _not_ consume the testcontext, and then move the
     // call to finalize() out of this funtion and into run_test in watch_test.rs.
     // This will involve making this function return errors instead of panicking, and
     // then calling clean_exit! in run_test(), I think.
-    ctx.finalize()
+    // Ok(ctx.finalize())
+    Ok(())
 }
 
 pub struct TestAction {

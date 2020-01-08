@@ -35,7 +35,7 @@ use cueball_manatee_primary_resolver::{
 // TODO remove this once done testing
 #[path = "../../tests/util.rs"]
 mod util;
-use util::{TestRunner};
+use util::{TestContext};
 
 fn parse_log_level(s: String) -> Result<Level, String> {
     match s.as_str() {
@@ -78,7 +78,7 @@ fn main() {
         .unwrap_or("/manatee/1.boray.virtual.example.com").parse::<String>()
         .unwrap();
     let l = parse_log_level(
-        matches.value_of("log level").unwrap_or("info").to_string()).unwrap();
+        matches.value_of("log level").unwrap_or("trace").to_string()).unwrap();
 
     std::process::exit(
         match run(s, p, l) {
@@ -100,7 +100,7 @@ fn run(s: ZkConnectString, p: String, l: Level) -> Result<(), String> {
             o!("build-id" => crate_version!()));
 
     let (tx, rx) = channel();
-    let mut ctx = TestRunner::new(s.clone(), p.clone());
+    let mut ctx = TestContext::new(s.clone(), p.clone());
 
     let resolver_thread = thread::spawn(move || {
         let mut resolver = ManateePrimaryResolver::new(s,
@@ -108,15 +108,16 @@ fn run(s: ZkConnectString, p: String, l: Level) -> Result<(), String> {
         resolver.run(tx);
     });
 
-
     println!("{:?}", util::resolver_connected(&mut ctx, &rx));
 
     loop {
         match rx.recv() {
             Ok(msg) => {
                 match msg {
-                    BackendMsg::AddedMsg(msg) => println!("Added msg: {:?}", msg.key),
-                    BackendMsg::RemovedMsg(msg) => println!("Removed msg: {:?}", msg.0),
+                    BackendMsg::AddedMsg(msg) =>
+                        println!("Added msg: {:?}", msg.key),
+                    BackendMsg::RemovedMsg(msg) =>
+                        println!("Removed msg: {:?}", msg.0),
                     BackendMsg::StopMsg => {
                         println!("Stop msg");
                         break;
