@@ -12,16 +12,12 @@
 // "critical" to see only the data that a client would.
 //
 
-use std::fmt::Debug;
-use std::process::exit;
 use std::sync::Mutex;
 use std::sync::mpsc::channel;
 use std::thread;
 
 use clap::{Arg, App, crate_name, crate_version};
 use cueball::resolver::{
-    BackendAddedMsg,
-    BackendRemovedMsg,
     BackendMsg,
     Resolver
 };
@@ -31,11 +27,6 @@ use cueball_manatee_primary_resolver::{
     ManateePrimaryResolver,
     ZkConnectString
 };
-
-// TODO remove this once done testing
-#[path = "../../tests/util.rs"]
-mod util;
-use util::{TestContext};
 
 fn parse_log_level(s: String) -> Result<Level, String> {
     match s.as_str() {
@@ -100,15 +91,12 @@ fn run(s: ZkConnectString, p: String, l: Level) -> Result<(), String> {
             o!("build-id" => crate_version!()));
 
     let (tx, rx) = channel();
-    let mut ctx = TestContext::new(s.clone(), p.clone());
 
-    let resolver_thread = thread::spawn(move || {
+    thread::spawn(move || {
         let mut resolver = ManateePrimaryResolver::new(s,
             p, Some(log));
         resolver.run(tx);
     });
-
-    println!("{:?}", util::resolver_connected(&mut ctx, &rx));
 
     loop {
         match rx.recv() {

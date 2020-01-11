@@ -904,7 +904,7 @@ mod test {
     use super::util;
     // use super::test_data;
 
-    #[path = "../tests/test_data.rs"]
+    #[path = "../tests/common/test_data.rs"]
     mod test_data;
 
     impl Arbitrary for ZkConnectString {
@@ -944,7 +944,7 @@ mod test {
             Mutex::new(LevelFilter::new(
                 slog_bunyan::with_name(crate_name!(),
                     std::io::stdout()).build(),
-                slog::Level::Trace)).fuse(),
+                slog::Level::Info)).fuse(),
                 o!("build-id" => crate_version!()))
     }
 

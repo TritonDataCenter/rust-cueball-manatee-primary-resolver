@@ -1,24 +1,16 @@
 use std::convert::From;
 use std::default::Default;
-use std::env;
-use std::fmt::{Debug, Display};
-use std::io::Error as IoError;
 use std::str::{FromStr};
-use std::sync::mpsc::{RecvTimeoutError, Receiver, Sender};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::mpsc::{Receiver, RecvError, RecvTimeoutError, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use failure::Error as FailureError;
-
-use futures::future::{Either};
-
-use clap::{crate_name, crate_version, App, Arg};
+use futures::future::Either;
 use tokio_zookeeper::*;
 use tokio::prelude::*;
 use tokio::runtime::Runtime;
 
-use cueball::backend::*;
 use cueball::resolver::{
     BackendAddedMsg,
     BackendRemovedMsg,
@@ -32,16 +24,13 @@ use cueball_manatee_primary_resolver::{
     ZkConnectString
 };
 
-use std::iter;
-use std::panic;
 use std::sync::mpsc::channel;
 
 use tokio_zookeeper::{Acl, CreateMode};
+use tokio_zookeeper::error as tokio_zk_error;
 use uuid::Uuid;
 
-// TODO do anything other than this
-#[path = "./test_data.rs"]
-mod test_data;
+use super::test_data;
 
 // pub macro_rules! clean_exit {
 //     ($self:expr) => ({
@@ -61,19 +50,55 @@ mod test_data;
 //     });
 // }
 
-// TODO impl From for various errors instead of converting manually in functions
 #[derive(Debug)]
 pub enum TestError {
     RecvTimeout,
     UnexpectedMessage,
     BackendMismatch(String),
     ZkError(String),
-    InvalidTimeout
+    InvalidTimeout,
+    DisconnectError
 }
 
 impl From<RecvTimeoutError> for TestError {
     fn from(_: RecvTimeoutError) -> Self {
         TestError::RecvTimeout
+    }
+}
+
+impl From<TryRecvError> for TestError {
+    fn from(_: TryRecvError) -> Self {
+        TestError::DisconnectError
+    }
+}
+
+impl From<RecvError> for TestError {
+    fn from(_: RecvError) -> Self {
+        TestError::DisconnectError
+    }
+}
+
+impl From<tokio_zk_error::Delete> for TestError {
+    fn from(e: tokio_zk_error::Delete) -> Self {
+        TestError::ZkError(format!("{:?}", e))
+    }
+}
+
+impl From<tokio_zk_error::Create> for TestError {
+    fn from(e: tokio_zk_error::Create) -> Self {
+        TestError::ZkError(format!("{:?}", e))
+    }
+}
+
+impl From<tokio_zk_error::SetData> for TestError {
+    fn from(e: tokio_zk_error::SetData) -> Self {
+        TestError::ZkError(format!("{:?}", e))
+    }
+}
+
+impl From<FailureError> for TestError {
+    fn from(e: FailureError) -> Self {
+        TestError::ZkError(format!("{:?}", e))
     }
 }
 
@@ -134,12 +159,19 @@ impl TestContext{
         self.rt.shutdown_now().wait().unwrap();
     }
 
-    fn set_zk_data(&mut self, path: String, data: Vec<u8>) -> Result<(), TestError> {
+    // TODO separate into a create() and a delete() method?
+    fn set_zk_data(&mut self, path: String, data: Vec<u8>)
+        -> Result<(), TestError> {
         self.rt.block_on(
             ZooKeeper::connect(&self.connect_string.to_string().parse().unwrap())
-            .and_then(move |(zk, watcher)| {
+            .and_then(move |(zk, _)| {
                 zk.exists(&path)
                 .and_then(move |(zk, stat)| {
+                    //
+                    // We have to do all this manual conversion below to make
+                    // the two match arms ultimately return the same
+                    // Result<Foo, Bar>.
+                    //
                     match stat {
                         None => {
                             Either::A(zk.create(
@@ -147,34 +179,51 @@ impl TestContext{
                                 data,
                                 Acl::open_unsafe(),
                                 CreateMode::Persistent
-                            ).map(|_| ()))
+                            ).map(|(_, res)| {
+                                res
+                                .map(|_| ())
+                                .map_err(|e| TestError::from(e))
+                            }))
                         }
                         Some(_) => {
                             Either::B(zk.set_data(
                                 &path,
                                 None,
                                 data
-                            ).map(|_| ()))
+                            ).map(|(_, res)| {
+                                res
+                                .map(|_| ())
+                                .map_err(|e| TestError::from(e))
+                            }))
                         }
                     }
                 })
             })
-            .map_err(|e| TestError::ZkError(format!("{:?}", e)))
-        )
+        //
+        // A double question mark! The first one unwraps the error returned by
+        // ZooKeeper::connect; the second one unwraps the error returned by
+        // create()/set_data().
+        //
+        )??;
+        Ok(())
     }
 
     fn delete_zk_node(&mut self, path: String) -> Result<(), TestError> {
         self.rt.block_on(
             ZooKeeper::connect(&self.connect_string.to_string().parse().unwrap())
-            .and_then(move |(zk, watcher)| {
+            .and_then(move |(zk, _)| {
                 zk.delete(
                     &path,
                     None
-                )
+                ).map(|(_, res)| res)
             })
-            .map(|_| ())
-            .map_err(|e| TestError::ZkError(format!("{:?}", e)))
-        )
+        )??;
+        //
+        // Another double question mark! The first one unwraps the error
+        // returned by ZooKeeper::connect; the second one unwraps the error
+        // returned by delete().
+        //
+        Ok(())
     }
 }
 
@@ -182,34 +231,57 @@ fn recv_timeout_discard_heartbeats(rx: &Receiver<BackendMsg>, timeout: Duration)
     -> Result<BackendMsg, TestError> {
 
     let start_time = Instant::now();
-    let failsafe = Duration::from_secs(10);
 
-    if timeout > failsafe {
-        return Err(TestError::InvalidTimeout);
-    }
+    const CHECK_INTERVAL: Duration = Duration::from_millis(10);
 
-    // TODO this is wonky because if the timeout is less than the heartbeat
-    // interval then the elapsed time only gets checked every heartbeat-interval
-    // seconds and that's not ideal
-    while start_time.elapsed() < timeout {
-        match rx.recv_timeout(failsafe)? {
-            BackendMsg::HeartbeatMsg => continue,
-            msg => return Ok(msg)
+    //
+    // Spawn a thread to send heartbeats over its own channel at a fine-grained
+    // frequency, for use in the loop below.
+    //
+    let (failsafe_tx, failsafe_rx) = channel();
+    thread::spawn(move || {
+        loop {
+            if failsafe_tx.send(BackendMsg::HeartbeatMsg).is_err() {
+                break;
+            }
+            thread::sleep(CHECK_INTERVAL);
         }
+    });
+
+
+    //
+    // This is a little wonky. We'd really like to do a select() between
+    // rx and failsafe_rx, but rust doesn't have a stable select() function
+    // that works with mpsc channels. Bummer! Instead, while the timeout hasn't
+    // run out, we try_recv on rx. If we don't find a non-hearbeat message,
+    // we wait on failsafe_rx, because we _know_ a message will come over it
+    // every CHECK_INTERVAL milliseconds. In this way, we rate-limit our
+    // repeated calls to try_recv. Oy!
+    //
+    while start_time.elapsed() < timeout {
+        match rx.try_recv() {
+            Err(TryRecvError::Empty) => (),
+            Err(e) => return Err(TestError::from(e)),
+            Ok(msg) => {
+                match msg {
+                    BackendMsg::HeartbeatMsg => (),
+                    msg => return Ok(msg)
+                }
+            }
+        }
+        failsafe_rx.recv()?;
     }
 
     Err(TestError::RecvTimeout)
 }
 
-// This assumes that the "<root path>/state" node already exists. TODO enforce this
+//
+// Checks if a resolver is connected to zookeeper. This function assumes tha
+// the "<root path>/state" node already exists, and will return 'false' if it
+// doesn't.
+//
 pub fn resolver_connected(ctx: &mut TestContext, rx: &Receiver<BackendMsg>)
     -> Result<bool, TestError> {
-
-    // fn is_connection_error(err: FailureError) -> bool {
-    //     // TODO find where `146` is defined as ConnectionRefused and use that
-    //     // instead
-    //     err.compat() == IoError::from_raw_os_error(146)
-    // }
 
     let data_path = ctx.root_path.clone() + "/state";
     let data_path_clone = data_path.clone();
@@ -221,10 +293,12 @@ pub fn resolver_connected(ctx: &mut TestContext, rx: &Receiver<BackendMsg>)
     // running, then the resolver is not connected to it, so we can return
     // `false` here.
     //
-    // TODO check that the error is the specific type we expect. This is
-    // difficult, because failure::Error doesn't really let you extract any
-    // structured information that we can compare to a known entity.
-    if let Err(_) = ctx.set_zk_data(data_path, test_data::backend_ip1_port1().raw_vec()) {
+    // It would be best to check that the error is the specific type we expect.
+    // This is difficult, because failure::Error doesn't really let you extract
+    // any structured information that we can compare to a known entity.
+    //
+    if let Err(_) = ctx.set_zk_data(data_path,
+        test_data::backend_ip1_port1().raw_vec()) {
         return Ok(false);
     }
 
@@ -245,12 +319,13 @@ pub fn resolver_connected(ctx: &mut TestContext, rx: &Receiver<BackendMsg>)
     // _something_, we know that the resolver is talking to the ZK server.
     //
     match channel_result {
-        Ok(m) => {
+        Ok(_) => {
             Ok(true)
         },
-        Err(e) => {
+        Err(TestError::RecvTimeout) => {
             Ok(false)
-        }
+        },
+        Err(e) => Err(e)
     }
 }
 
@@ -274,7 +349,7 @@ pub fn run_test_case(
         let (tx, rx) = channel();
         let connect_string = ctx.connect_string.clone();
         let root_path_resolver = ctx.root_path.clone();
-        let resolver_thread = thread::spawn(move || {
+        thread::spawn(move || {
             let mut resolver = ManateePrimaryResolver::new(connect_string,
                 root_path_resolver, None);
             resolver.run(tx);
@@ -326,7 +401,7 @@ pub fn run_test_case(
     };
 
     // Receive as many messages as we expect
-    for i in 0..expected_message_count {
+    for _ in 0..expected_message_count {
         let m = recv_timeout_discard_heartbeats(&rx, Duration::from_secs(2))?;
         received_messages.push(m);
     }

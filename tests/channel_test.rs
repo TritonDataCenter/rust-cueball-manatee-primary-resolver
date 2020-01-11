@@ -1,51 +1,19 @@
-use std::env;
-use std::fmt::{Debug, Display};
-use std::process::Command;
-use std::str::{FromStr};
-use std::sync::mpsc::{RecvTimeoutError, Receiver, Sender};
+use std::str::FromStr;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use clap::{crate_name, crate_version, App, Arg};
-use tokio_zookeeper::*;
-use tokio::prelude::*;
-use tokio::runtime::Runtime;
-
-use cueball::backend::*;
-use cueball::resolver::{
-    BackendAddedMsg,
-    BackendRemovedMsg,
-    BackendMsg,
-    Resolver
-};
+use cueball::resolver::Resolver;
 
 use cueball_manatee_primary_resolver::{
     ManateePrimaryResolver,
     ZkConnectString,
     HEARTBEAT_INTERVAL,
-    RECONNECT_DELAY,
-    SESSION_TIMEOUT,
-    TCP_CONNECT_TIMEOUT,
 };
 
-use std::iter;
-use std::panic;
 use std::sync::mpsc::channel;
 
-use tokio_zookeeper::{Acl, CreateMode};
 use uuid::Uuid;
-
-use util::{TestContext};
-
-#[derive(Debug, PartialEq)]
-enum ZkStatus {
-    Enabled,
-    Disabled
-}
-
-pub mod util;
-pub mod test_data;
 
 //
 // Tests that the resolver exits immediately if the receiver is closed when the
@@ -69,7 +37,7 @@ fn channel_test_start_with_closed_rx() {
     // Close the receiver before the resolver even starts
     drop(rx);
 
-    let resolver_thread = thread::spawn(move || {
+    thread::spawn(move || {
         let (lock, cvar) = &*pair2;
         let mut resolver = ManateePrimaryResolver::new(connect_string,
             root_path_resolver, None);
@@ -112,7 +80,7 @@ fn channel_test_exit_upon_closed_rx() {
     let pair = Arc::new((Mutex::new(false), Condvar::new()));
     let pair2 = pair.clone();
 
-    let resolver_thread = thread::spawn(move || {
+    thread::spawn(move || {
         let (lock, cvar) = &*pair2;
         let mut resolver = ManateePrimaryResolver::new(connect_string,
             root_path_resolver, None);
@@ -123,7 +91,7 @@ fn channel_test_exit_upon_closed_rx() {
     });
 
     //
-    // We want this thread to not progress until the resolver_thread above has
+    // We want this thread to not progress until the resolver thread above has
     // time to set the watch and block. REALLY, this should be done with thread
     // priorities, but the thread-priority crate depends on some pthread
     // functions that _aren't in the libc crate for illumos_. We should add

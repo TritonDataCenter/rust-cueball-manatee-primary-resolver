@@ -6,7 +6,7 @@ edition = "2018"
 
 [dependencies]
 clap = "2.32"
-cueball = { git = 'https://github.com/joyent/rust-cueball', tag = 'v0.3.0' }
+cueball = { git = "https://github.com/joyent/rust-cueball", tag = "v0.3.0" }
 itertools = "0.8.0"
 failure = "0.1.5"
 futures = "0.1.28"
@@ -17,12 +17,11 @@ slog = { version = "2.4.1", features = [ "max_level_trace" ] }
 slog-bunyan = { git = "https://github.com/slog-rs/bunyan" }
 slog-stdlog = "3"
 tokio = "0.1.22"
-tokio-zookeeper = { git = 'https://github.com/joyent/tokio-zookeeper', tag = "v0.1.0"}
+tokio-zookeeper = { git = "https://github.com/joyent/tokio-zookeeper", tag = "v0.1.0"}
 unicode-normalization = "=0.1.5"
 url = "2.1.0"
-# TODO move uuid back to dev-dependencies after done testing
-uuid = { version = "0.8", features = ["v4"] }
 
 [dev-dependencies]
 quickcheck = "0.8.0"
 serial_test = "0.3.2"
+uuid = { version = "0.8", features = ["v4"] }

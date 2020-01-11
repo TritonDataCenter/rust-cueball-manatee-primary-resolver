@@ -1,43 +1,20 @@
-use std::env;
-use std::fmt::{Debug, Display};
+use std::fmt::Debug;
 use std::process::Command;
-use std::str::{FromStr};
-use std::sync::mpsc::{RecvTimeoutError, Receiver, Sender};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::mpsc::channel;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use clap::{crate_name, crate_version, App, Arg};
 use serial_test::serial;
-use tokio_zookeeper::*;
-use tokio::prelude::*;
-use tokio::runtime::Runtime;
 
-use cueball::backend::*;
-use cueball::resolver::{
-    BackendAddedMsg,
-    BackendRemovedMsg,
-    BackendMsg,
-    Resolver
-};
+use cueball::resolver::Resolver;
 
 use cueball_manatee_primary_resolver::{
     ManateePrimaryResolver,
-    ZkConnectString,
-    HEARTBEAT_INTERVAL,
     RECONNECT_DELAY,
-    SESSION_TIMEOUT,
     TCP_CONNECT_TIMEOUT,
 };
 
-use std::iter;
-use std::panic;
-use std::sync::mpsc::channel;
-
-use tokio_zookeeper::{Acl, CreateMode};
-use uuid::Uuid;
-
-use util::{TestContext};
+use util::TestContext;
 
 #[derive(Debug, PartialEq)]
 enum ZkStatus {
@@ -45,9 +22,10 @@ enum ZkStatus {
     Disabled
 }
 
-mod util;
-mod test_data;
+pub mod common;
+use common::util;
 
+//
 fn toggle_zookeeper(status: ZkStatus) {
     const SVCADM_PATH: &str = "/usr/sbin/svcadm";
     const SVCADM_ZOOKEEPER_SERVICE_NAME: &str = "zookeeper";
@@ -82,7 +60,7 @@ fn connection_test_start_with_unreachable_zookeeper() {
     let (tx, rx) = channel();
 
     let mut ctx = TestContext::default();
-    ctx.setup_zk_nodes();
+    ctx.setup_zk_nodes().unwrap();
 
     let connect_string_resolver = ctx.connect_string.clone();
     let root_path_resolver = ctx.root_path.clone();
@@ -91,7 +69,7 @@ fn connection_test_start_with_unreachable_zookeeper() {
     toggle_zookeeper(ZkStatus::Disabled);
 
     // We expect resolver not to connect at this point
-    let resolver_thread = thread::spawn(move || {
+    thread::spawn(move || {
         let mut resolver = ManateePrimaryResolver::new(connect_string_resolver,
             root_path_resolver, None);
         resolver.run(tx_clone);
@@ -115,7 +93,7 @@ fn connection_test_start_with_unreachable_zookeeper() {
     assert!(util::resolver_connected(&mut ctx, &rx).unwrap(),
         "Resolver should be connected to Zookeeper");
 
-    ctx.teardown_zk_nodes();
+    ctx.teardown_zk_nodes().unwrap();
     ctx.finalize();
 }
 
@@ -130,14 +108,14 @@ fn connection_test_reconnect_after_zk_hiccup() {
     let (tx, rx) = channel();
 
     let mut ctx = TestContext::default();
-    ctx.setup_zk_nodes();
+    ctx.setup_zk_nodes().unwrap();
 
     let connect_string_resolver = ctx.connect_string.clone();
     let root_path_resolver = ctx.root_path.clone();
 
     let tx_clone = tx.clone();
 
-    let resolver_thread = thread::spawn(move || {
+    thread::spawn(move || {
         let mut resolver = ManateePrimaryResolver::new(connect_string_resolver,
             root_path_resolver, None);
         resolver.run(tx_clone);
@@ -166,6 +144,6 @@ fn connection_test_reconnect_after_zk_hiccup() {
     assert!(util::resolver_connected(&mut ctx, &rx).unwrap(),
         "Resolver should be connected to Zookeeper");
 
-    ctx.teardown_zk_nodes();
+    ctx.teardown_zk_nodes().unwrap();
     ctx.finalize();
 }

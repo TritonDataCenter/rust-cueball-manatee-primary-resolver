@@ -1,41 +1,7 @@
-use std::env;
-use std::fmt::{Debug, Display};
-use std::str::{FromStr};
-use std::sync::mpsc::{RecvTimeoutError, Receiver, Sender};
-use std::sync::{Arc, Condvar, Mutex};
-use std::thread;
-use std::time::{Duration, Instant};
 
-use clap::{crate_name, crate_version, App, Arg};
-use tokio_zookeeper::*;
-use tokio::prelude::*;
-use tokio::runtime::Runtime;
-
-use cueball::backend::*;
-use cueball::resolver::{
-    BackendAddedMsg,
-    BackendRemovedMsg,
-    BackendMsg,
-    Resolver
-};
-
-use cueball_manatee_primary_resolver::{
-    ManateePrimaryResolver,
-    ZkConnectString,
-    WATCH_LOOP_DELAY
-};
-
-use std::iter;
-use std::panic;
-use std::sync::mpsc::channel;
-
-use tokio_zookeeper::{Acl, CreateMode};
-use uuid::Uuid;
-
-mod util;
-mod test_data;
-
-use util::{TestContext, TestAction, run_test_case};
+pub mod common;
+use common::test_data;
+use common::util::{TestContext, TestAction, run_test_case};
 
 // fn watch_test_nonexistent_node() {
 //     let (tx, rx) = channel();
@@ -123,7 +89,7 @@ fn watch_test_port_ip_change() {
         added_start_backend: Some(data_1.added_msg()),
         added_backend: Some(data_2.added_msg()),
         removed_backend: Some(data_1.removed_msg())
-    }, None);
+    }, None).unwrap();
 }
 
 #[test]
@@ -137,7 +103,7 @@ fn watch_test_ip_change() {
         added_start_backend: Some(data_1.added_msg()),
         added_backend: Some(data_2.added_msg()),
         removed_backend: Some(data_1.removed_msg())
-    }, None);
+    }, None).unwrap();
 }
 
 #[test]
@@ -151,7 +117,7 @@ fn watch_test_port_change() {
         added_start_backend: Some(data_1.added_msg()),
         added_backend: Some(data_2.added_msg()),
         removed_backend: Some(data_1.removed_msg())
-    }, None);
+    }, None).unwrap();
 }
 
 #[test]
@@ -162,7 +128,7 @@ fn watch_test_no_change() {
         added_start_backend: Some(test_data::backend_ip1_port1().added_msg()),
         added_backend: None,
         removed_backend: None
-    }, None);
+    }, None).unwrap();
 }
 
 #[test]
@@ -175,7 +141,7 @@ fn watch_test_invalid_to_valid() {
         added_start_backend: None,
         added_backend: Some(data.added_msg()),
         removed_backend: None
-    }, None);
+    }, None).unwrap();
 }
 
 #[test]
@@ -190,7 +156,7 @@ fn watch_test_invalid_to_invalid() {
         added_start_backend: None,
         added_backend: None,
         removed_backend: None
-    }, None);
+    }, None).unwrap();
 }
 
 #[test]
@@ -203,7 +169,7 @@ fn watch_test_valid_to_no_ip() {
         added_start_backend: Some(data.added_msg()),
         added_backend: None,
         removed_backend: None
-    }, None);
+    }, None).unwrap();
 }
 
 #[test]
@@ -216,7 +182,7 @@ fn watch_test_valid_to_invalid_ip() {
         added_start_backend: Some(data.added_msg()),
         added_backend: None,
         removed_backend: None
-    }, None);
+    }, None).unwrap();
 }
 
 #[test]
@@ -229,7 +195,7 @@ fn watch_test_valid_to_wrong_type_ip() {
         added_start_backend: Some(data.added_msg()),
         added_backend: None,
         removed_backend: None
-    }, None);
+    }, None).unwrap();
 }
 
 #[test]
@@ -242,7 +208,7 @@ fn watch_test_valid_to_no_pg_url() {
         added_start_backend: Some(data.added_msg()),
         added_backend: None,
         removed_backend: None
-    }, None);
+    }, None).unwrap();
 }
 
 #[test]
@@ -255,7 +221,7 @@ fn watch_test_valid_to_invalid_pg_url() {
         added_start_backend: Some(data.added_msg()),
         added_backend: None,
         removed_backend: None
-    }, None);
+    }, None).unwrap();
 }
 
 #[test]
@@ -268,7 +234,7 @@ fn watch_test_valid_to_wrong_type_pg_url() {
         added_start_backend: Some(data.added_msg()),
         added_backend: None,
         removed_backend: None
-    }, None);
+    }, None).unwrap();
 }
 
 #[test]
@@ -281,7 +247,7 @@ fn watch_test_valid_to_no_port_pg_url() {
         added_start_backend: Some(data.added_msg()),
         added_backend: None,
         removed_backend: None
-    }, None);
+    }, None).unwrap();
 }
 
 #[test]
@@ -294,5 +260,5 @@ fn watch_test_valid_to_invalid_json() {
         added_start_backend: Some(data.added_msg()),
         added_backend: None,
         removed_backend: None
-    }, None);
+    }, None).unwrap();
 }

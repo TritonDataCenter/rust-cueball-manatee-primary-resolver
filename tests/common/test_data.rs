@@ -8,8 +8,6 @@ use cueball::backend::*;
 use cueball::resolver::{
     BackendAddedMsg,
     BackendRemovedMsg,
-    BackendMsg,
-    Resolver
 };
 
 pub fn json_vec(ip: &str, port: u16) -> Vec<u8> {
