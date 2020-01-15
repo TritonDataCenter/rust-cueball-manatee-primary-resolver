@@ -65,7 +65,7 @@ use cueball::resolver::{
     Resolver
 };
 
-pub mod util;
+pub mod common;
 
 //
 // The interval at which the resolver should send heartbeats via the
@@ -899,13 +899,8 @@ mod test {
     use std::vec::Vec;
 
     use quickcheck::{quickcheck, Arbitrary, Gen};
-    use slog::LevelFilter;
 
-    use super::util;
-    // use super::test_data;
-
-    #[path = "../tests/common/test_data.rs"]
-    mod test_data;
+    use common::{util, test_data};
 
     impl Arbitrary for ZkConnectString {
         fn arbitrary<G: Gen>(g: &mut G) -> Self {
@@ -939,15 +934,6 @@ mod test {
 
     // Below: test process_value()
 
-    fn test_log() -> Logger {
-        Logger::root(
-            Mutex::new(LevelFilter::new(
-                slog_bunyan::with_name(crate_name!(),
-                    std::io::stdout()).build(),
-                slog::Level::Info)).fuse(),
-                o!("build-id" => crate_version!()))
-    }
-
     //
     // Represents a process_value test case, including inputs and expected
     // outputs.
@@ -971,7 +957,7 @@ mod test {
             &tx.clone(),
             &input.value,
             last_backend,
-            test_log());
+            util::log_from_env(util::DEFAULT_LOG_LEVEL).unwrap());
         match input.expected_error {
             None => assert_eq!(result, Ok(())),
             Some(expected_error) => {
@@ -1040,7 +1026,7 @@ mod test {
     }
 
     #[test]
-    fn port_ip_change_test() {
+    fn process_value_test_port_ip_change() {
         let data_1 = test_data::backend_ip1_port1();
         let data_2 = test_data::backend_ip2_port2();
 
@@ -1054,7 +1040,7 @@ mod test {
     }
 
     #[test]
-    fn port_change_test() {
+    fn process_value_test_port_change() {
         let data_1 = test_data::backend_ip1_port1();
         let data_2 = test_data::backend_ip2_port1();
 
@@ -1068,7 +1054,7 @@ mod test {
     }
 
     #[test]
-    fn ip_change_test() {
+    fn process_value_test_ip_change() {
         let data_1 = test_data::backend_ip1_port1();
         let data_2 = test_data::backend_ip1_port2();
 
@@ -1082,7 +1068,7 @@ mod test {
     }
 
     #[test]
-    fn no_change_test() {
+    fn process_value_test_no_change() {
         let data = test_data::backend_ip1_port1();
 
         run_process_value_fields(ProcessValueFields{
@@ -1095,7 +1081,7 @@ mod test {
     }
 
     #[test]
-    fn no_ip_test() {
+    fn process_value_test_no_ip() {
         let filler = test_data::backend_ip1_port1();
 
         run_process_value_fields(ProcessValueFields{
@@ -1108,7 +1094,7 @@ mod test {
     }
 
     #[test]
-    fn wrong_type_ip_test() {
+    fn process_value_test_wrong_type_ip() {
         let filler = test_data::backend_ip1_port1();
 
         run_process_value_fields(ProcessValueFields{
@@ -1121,7 +1107,7 @@ mod test {
     }
 
     #[test]
-    fn invalid_ip_test() {
+    fn process_value_test_invalid_ip() {
         let filler = test_data::backend_ip1_port1();
 
         run_process_value_fields(ProcessValueFields{
@@ -1134,7 +1120,7 @@ mod test {
     }
 
     #[test]
-    fn no_pg_url_test() {
+    fn process_value_test_no_pg_url() {
         let filler = test_data::backend_ip1_port1();
 
         run_process_value_fields(ProcessValueFields{
@@ -1148,7 +1134,7 @@ mod test {
     }
 
     #[test]
-    fn wrong_type_pg_url_test() {
+    fn process_value_test_wrong_type_pg_url() {
         let filler = test_data::backend_ip1_port1();
 
         run_process_value_fields(ProcessValueFields{
@@ -1162,7 +1148,7 @@ mod test {
     }
 
     #[test]
-    fn invalid_pg_url_test() {
+    fn process_value_test_invalid_pg_url() {
         let filler = test_data::backend_ip1_port1();
 
         run_process_value_fields(ProcessValueFields{
@@ -1176,7 +1162,7 @@ mod test {
     }
 
     #[test]
-    fn no_port_pg_url_test() {
+    fn process_value_test_no_port_pg_url() {
         let filler = test_data::backend_ip1_port1();
 
         run_process_value_fields(ProcessValueFields{
@@ -1190,7 +1176,7 @@ mod test {
     }
 
     #[test]
-    fn invalid_json_test() {
+    fn process_value_test_invalid_json() {
         let filler = test_data::backend_ip1_port1();
 
         run_process_value_fields(ProcessValueFields{

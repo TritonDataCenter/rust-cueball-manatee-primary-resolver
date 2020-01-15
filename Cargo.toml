@@ -20,8 +20,8 @@ tokio = "0.1.22"
 tokio-zookeeper = { git = "https://github.com/joyent/tokio-zookeeper", tag = "v0.1.0"}
 unicode-normalization = "=0.1.5"
 url = "2.1.0"
+uuid = { version = "0.8", features = ["v4"] }
 
 [dev-dependencies]
 quickcheck = "0.8.0"
 serial_test = "0.3.2"
-uuid = { version = "0.8", features = ["v4"] }

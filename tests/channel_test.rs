@@ -9,7 +9,9 @@ use cueball_manatee_primary_resolver::{
     ManateePrimaryResolver,
     ZkConnectString,
     HEARTBEAT_INTERVAL,
+    common
 };
+use common::util;
 
 use std::sync::mpsc::channel;
 
@@ -37,10 +39,11 @@ fn channel_test_start_with_closed_rx() {
     // Close the receiver before the resolver even starts
     drop(rx);
 
+    let log = util::log_from_env(util::DEFAULT_LOG_LEVEL).unwrap();
     thread::spawn(move || {
         let (lock, cvar) = &*pair2;
         let mut resolver = ManateePrimaryResolver::new(connect_string,
-            root_path_resolver, None);
+            root_path_resolver, Some(log));
         resolver.run(tx_clone);
         let mut resolver_exited = lock.lock().unwrap();
         *resolver_exited = true;
@@ -80,10 +83,11 @@ fn channel_test_exit_upon_closed_rx() {
     let pair = Arc::new((Mutex::new(false), Condvar::new()));
     let pair2 = pair.clone();
 
+    let log = util::log_from_env(util::DEFAULT_LOG_LEVEL).unwrap();
     thread::spawn(move || {
         let (lock, cvar) = &*pair2;
         let mut resolver = ManateePrimaryResolver::new(connect_string,
-            root_path_resolver, None);
+            root_path_resolver, Some(log));
         resolver.run(tx_clone);
         let mut resolver_exited = lock.lock().unwrap();
         *resolver_exited = true;
