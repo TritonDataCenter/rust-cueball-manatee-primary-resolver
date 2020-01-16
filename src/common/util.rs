@@ -23,6 +23,12 @@ use cueball::resolver::{
     Resolver
 };
 
+// TODO replace all calls to unwrap() with calls to expect()
+// TODO run clippy
+// TODO replace magic numbers (especially delays) with constants
+// TODO go through and format and clean up everything
+// TODO transfer to rust-cueball monorepo
+
 use crate::{
     ManateePrimaryResolver,
     ZkConnectString
@@ -133,7 +139,7 @@ impl TestContext{
         }
     }
 
-    fn setup_zk_nodes(&mut self) -> Result<(), TestError> {
+    pub fn setup_zk_nodes(&mut self) -> Result<(), TestError> {
         let root_path = self.root_path.clone();
         let data_path = root_path.clone() + "/state";
         self.create_zk_node(root_path, Vec::new())?;
@@ -141,7 +147,7 @@ impl TestContext{
         Ok(())
     }
 
-    fn teardown_zk_nodes(&mut self) -> Result<(), TestError> {
+    pub fn teardown_zk_nodes(&mut self) -> Result<(), TestError> {
         let root_path = self.root_path.clone();
         let data_path = root_path.clone() + "/state";
 
@@ -153,9 +159,7 @@ impl TestContext{
 
     fn finalize(self) {
         // Wait for the futures to resolve
-        // TODO are they guaranteed to have all resolved already at this point?
-        // ^evidently not -- why does shutdown_on_idle block?
-        self.rt.shutdown_now().wait().unwrap();
+        self.rt.shutdown_on_idle().wait().unwrap();
     }
 
     fn create_zk_node(&mut self, path: String, data: Vec<u8>)
@@ -220,10 +224,10 @@ impl TestContext{
         Ok(())
     }
 
-    fn run_test_case(
+    pub fn run_test_case(
         &mut self,
         input: TestAction,
-        external_rx: Option<Receiver<BackendMsg>>
+        external_rx: Option<&Receiver<BackendMsg>>
     ) -> Result<(), TestError> {
         let data_path_start = self.root_path.clone() + "/state";
         let data_path_end = self.root_path.clone() + "/state";
@@ -231,22 +235,30 @@ impl TestContext{
         let end_data = input.end_data;
 
         //
+        // We create these early in order to appease the borrow checker, even
+        // if we don't need them. We can't create them in the "None" block
+        // below because we can't return a reference to a variable that goes
+        // out of scope. There might be a better way to do this.
+        //
+        let (tx, rx) = channel();
+
+        //
         // Start a resolver if we didn't get an external rx
         //
         let log = log_from_env(DEFAULT_LOG_LEVEL)?;
-        let rx = external_rx.unwrap_or_else(|| {
-            let (tx, rx) = channel();
-            let connect_string = self.connect_string.clone();
-            let root_path_resolver = self.root_path.clone();
-            thread::spawn(move || {
-                let mut resolver = ManateePrimaryResolver::new(connect_string,
-                    root_path_resolver, Some(log));
-                resolver.run(tx);
-            });
-            rx
-        });
-
-        self.set_zk_data(data_path_start, start_data)?;
+        let rx = match external_rx {
+            Some(rx) => rx,
+            None => {
+                let connect_string = self.connect_string.clone();
+                let root_path_resolver = self.root_path.clone();
+                thread::spawn(move || {
+                    let mut resolver = ManateePrimaryResolver::new(connect_string,
+                        root_path_resolver, Some(log));
+                    resolver.run(tx);
+                });
+                &rx
+            }
+        };
 
         //
         // We want this thread to not progress until the resolver_thread above
@@ -256,25 +268,18 @@ impl TestContext{
         // We should add these functions and upstream a change, but, for now,
         // here's this.
         //
-        thread::sleep(Duration::from_secs(2));
+        thread::sleep(Duration::from_secs(1));
+
+        self.set_zk_data(data_path_start, start_data)?;
+
+        //
+        // The above call to set_zk_data _might_ have caused a message to be
+        // sent, depending on the node's preexisting data. We thus flush the
+        // channel here.
+        //
+        flush_channel(rx)?;
 
         self.set_zk_data(data_path_end, end_data)?;
-
-        //
-        // The test runner starts out with no data at the zookeeper node. Thus,
-        // if start_data represents a valid backend, setting the node's data
-        // to start_data will produce an AddedMsg. This isn't related to the
-        // transition between start_data and end_data, but we should still make
-        // sure that the message is received as we expect. We do that here.
-        //
-        if let Some(msg) = input.added_start_backend {
-            let m = recv_timeout_discard_heartbeats(&rx, Duration::from_secs(2))?;
-            if m != BackendMsg::AddedMsg(msg) {
-                return Err(TestError::BackendMismatch(
-                    "Message received does not match expected \
-                    added_start_backend message".to_string()))
-            }
-        }
 
         let mut received_messages = Vec::new();
 
@@ -291,12 +296,13 @@ impl TestContext{
 
         // Receive as many messages as we expect
         for _ in 0..expected_message_count {
-            let m = recv_timeout_discard_heartbeats(&rx, Duration::from_secs(2))?;
+            let m = recv_timeout_discard_heartbeats(rx, Duration::from_secs(2))?;
             received_messages.push(m);
         }
 
+        println!("here");
         // Make sure there are no more messages waiting
-        match recv_timeout_discard_heartbeats(&rx, Duration::from_secs(2)) {
+        match recv_timeout_discard_heartbeats(rx, Duration::from_secs(2)) {
             Err(TestError::RecvTimeout) => (),
             Err(e) => return Err(e),
             _ => return Err(TestError::UnexpectedMessage)
@@ -332,6 +338,7 @@ impl TestContext{
     // and panics if the test returned an error.
     //
     pub fn run_action_and_finalize(mut self, action: TestAction) {
+        toggle_zookeeper(ZkStatus::Enabled).unwrap();
         self.setup_zk_nodes().unwrap();
         let result = self.run_test_case(action, None);
         self.teardown_zk_nodes().unwrap();
@@ -356,6 +363,7 @@ impl TestContext{
     pub fn run_func_and_finalize<F>(mut self, func: F)
         where F: FnOnce(&mut TestContext) -> Result<(), TestError>
     {
+        toggle_zookeeper(ZkStatus::Enabled).unwrap();
         self.setup_zk_nodes().unwrap();
         let result = func(&mut self);
         self.teardown_zk_nodes().unwrap();
@@ -422,7 +430,6 @@ fn recv_timeout_discard_heartbeats(rx: &Receiver<BackendMsg>, timeout: Duration)
         }
     });
 
-
     //
     // This is a little wonky. We'd really like to do a select() between
     // rx and failsafe_rx, but rust doesn't have a stable select() function
@@ -449,17 +456,31 @@ fn recv_timeout_discard_heartbeats(rx: &Receiver<BackendMsg>, timeout: Duration)
     Err(TestError::RecvTimeout)
 }
 
+fn flush_channel(rx: &Receiver<BackendMsg>) -> Result<(), TestError> {
+    loop {
+        match recv_timeout_discard_heartbeats(&rx, Duration::from_secs(1)) {
+            Ok(_) => {
+                println!("msg");
+                continue;
+            },
+            Err(TestError::RecvTimeout) => return Ok(()),
+            Err(e) => return Err(e)
+        }
+    }
+}
+
 //
 // Checks if a resolver is connected to zookeeper. This function assumes that
 // the "<root path>/state" node already exists, and will return 'false' if it
 // doesn't.
 //
 // This function attempts to get the resolver to send a message over the passed-
-// in channel, and then receives that message. This means that the channel
-// should be empty, so we don't receive a _different_ message than the one we
-// expect. This in turn means that if other functions also intend to
-// send/receive, they shouldn't be running at the same time as this one. In the
-// long run, we should probably use a mutex to protect the channel.
+// in channel, and then receives that message. In order to be able to verify
+// that the exact expected messages were sent, it flushes the channel before
+// changing the ZK node's data from the first value to the second value. Thus,
+// any existing messages in the channel will be discarded. Care must be taken
+// to account for this behavior when using the channel in code that precedes
+// the invocation of this function.
 //
 pub fn resolver_connected(ctx: &mut TestContext, rx: &Receiver<BackendMsg>)
     -> Result<bool, TestError> {
@@ -484,30 +505,70 @@ pub fn resolver_connected(ctx: &mut TestContext, rx: &Receiver<BackendMsg>)
     }
 
     //
+    // Get rid of any outstanding messages, including the one that the above
+    // call to set_zk_data might have produced
+    //
+    flush_channel(&rx)?;
+
+    //
     // If we got here, it means that the _above_ call to set_zk_data()
-    // succeeded, which means that zookeeper is running. Thus, we don't expect
-    // the second call to set_zk_data() to error, and panic if it does.
+    // succeeded, which means that zookeeper is running. Thus, we return various
+    // errors below if the observed behavior doesn't make sense.
     //
     ctx.set_zk_data(data_path_clone, test_data::backend_ip2_port2().raw_vec())?;
 
-    let channel_result =
-            recv_timeout_discard_heartbeats(&rx, Duration::from_secs(2));
+    let mut received_messages = Vec::new();
 
     //
-    // Just verify that we receive some message. In other tests, we verify that
-    // we receive exactly the messages we expect, so as long as we get
-    // _something_, we know that the resolver is talking to the ZK server.
+    // We expect to receive two messages in total. Here, we try to receive the
+    // first one. If we don't get a message, then we assume that the resolver is
+    // not connected.
     //
-    // TODO check for exact match
-    match channel_result {
-        Ok(_) => {
-            Ok(true)
-        },
-        Err(TestError::RecvTimeout) => {
-            Ok(false)
-        },
-        Err(e) => Err(e)
+    match recv_timeout_discard_heartbeats(&rx, Duration::from_secs(2)) {
+        Ok(m) => received_messages.push(m),
+        Err(TestError::RecvTimeout) => return Ok(false),
+        Err(e) => return Err(e)
     }
+
+    //
+    // We try to receive the second message. If we don't get one, we return an
+    // error. We already received one message, so it's unexpected behavior not
+    // to receive a second one.
+    //
+    match recv_timeout_discard_heartbeats(&rx, Duration::from_secs(2)) {
+        Ok(m) => received_messages.push(m),
+        Err(e) => return Err(e)
+    }
+
+    // Make sure there are no more messages waiting
+    match recv_timeout_discard_heartbeats(&rx, Duration::from_secs(2)) {
+        Err(TestError::RecvTimeout) => (),
+        Err(e) => return Err(e),
+        _ => return Err(TestError::UnexpectedMessage)
+    }
+
+    //
+    // We now know that we have two messages. If they don't match what we
+    // expect, we return an UnexpectedMessage error.
+    //
+
+    let msg = BackendMsg::RemovedMsg(test_data::backend_ip1_port1().removed_msg());
+    match find_msg_match(&received_messages, &msg) {
+        None => return Err(TestError::UnexpectedMessage),
+        Some(index) => {
+            received_messages.remove(index);
+        }
+    }
+
+    let msg = BackendMsg::AddedMsg(test_data::backend_ip2_port2().added_msg());
+    match find_msg_match(&received_messages, &msg) {
+        None => return Err(TestError::UnexpectedMessage),
+        Some(index) => {
+            received_messages.remove(index);
+        }
+    }
+
+    Ok(true)
 }
 
 ///
@@ -531,11 +592,6 @@ pub struct TestAction {
     pub start_data: Vec<u8>,
     // Another data string for the same node
     pub end_data: Vec<u8>,
-    //
-    // The message expected when transitioning from an empty zookeeper node to
-    // start_data
-    //
-    pub added_start_backend: Option<BackendAddedMsg>,
     //
     // The messages expected when transitioning from start_data to end_data
     //

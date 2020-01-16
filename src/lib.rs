@@ -50,6 +50,7 @@ use slog::{
 };
 use slog::Result as SlogResult;
 use slog::Value as SlogValue;
+// TODO ditch the asterisk imports (here and everywhere)
 use tokio_zookeeper::*;
 use tokio::prelude::*;
 use tokio::runtime::Runtime;
@@ -297,6 +298,30 @@ impl ManateePrimaryResolver {
     }
 }
 
+//
+// Returns a mock event that can be used to bootstrap the watch loop. We use
+// a NodeDataChanged event because the watch loop's response to this type of
+// event is to get the data from the node being watched, which is also what
+// we want to do when we start the watch loop anew.
+//
+fn mock_event() -> WatchedEvent {
+    WatchedEvent {
+        event_type: WatchedEventType::NodeDataChanged,
+        //
+        // This artificial keeper_state doesn't necessarily reflect reality, but
+        // that's ok because it's paired with an artificial NodeDataChanged
+        // event, and our handling for this type of event doesn't involve the
+        // keeper_state field.
+        //
+        keeper_state: KeeperState::SyncConnected,
+        //
+        // We never use `path`, so we might as well set it to an
+        // empty string in our artificially constructed WatchedEvent
+        // object.
+        //
+        path: "".to_string(),
+    }
+}
 ///
 /// Parses the given zookeeper node data into a Backend object, compares it to
 /// the last Backend sent to the cueball connection pool, and sends it to the
@@ -565,13 +590,14 @@ fn watch_loop(
                 },
                 WatchedEventType::NodeDeleted => {
                     //
-                    // Same behavior as the above case where we didn't get the
-                    // data because the node doesn't exist. See comment above.
+                    // The node doesn't exist, but we can't use the existing
+                    // event, or we'll just loop on this case forever. We use
+                    // the mock event instead.
                     //
                     info!(log, "ZK node deleted");
                     return Either::A(ok(Loop::Continue(WatchLoopState {
                         watcher,
-                        curr_event,
+                        curr_event: mock_event(),
                         delay: WATCH_LOOP_DELAY
                     })));
                 },
@@ -596,7 +622,7 @@ fn watch_loop(
                             Loop::Continue(WatchLoopState {
                                 watcher,
                                 curr_event: event,
-                                delay:WATCH_LOOP_NODELAY
+                                delay: WATCH_LOOP_NODELAY
                             })
                         },
                         //
@@ -686,23 +712,7 @@ fn connect_loop(
             //
             loop_fn(WatchLoopState {
                 watcher: Box::new(default_watcher),
-                curr_event: WatchedEvent {
-                    event_type: WatchedEventType::NodeDataChanged,
-                    //
-                    // This initial artificial keeper_state doesn't necessarily
-                    // reflect reality, but that's ok because it's paired with
-                    // an artificial NodeDataChanged event, and our handling for
-                    // this type of event doesn't involve the keeper_state
-                    // field.
-                    //
-                    keeper_state: KeeperState::SyncConnected,
-                    //
-                    // We never use `path`, so we might as well set it to an
-                    // empty string in our artificially constructed WatchedEvent
-                    // object.
-                    //
-                    path: "".to_string(),
-                },
+                curr_event: mock_event(),
                 delay: WATCH_LOOP_NODELAY
             } , move |loop_state| {
                 //

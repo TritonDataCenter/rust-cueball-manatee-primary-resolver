@@ -27,7 +27,6 @@ fn connection_test_start_with_unreachable_zookeeper() {
         let connect_string_resolver = ctx.connect_string.clone();
         let root_path_resolver = ctx.root_path.clone();
 
-        let tx_clone = tx.clone();
         util::toggle_zookeeper(ZkStatus::Disabled)?;
 
         // We expect resolver not to connect at this point
@@ -35,7 +34,7 @@ fn connection_test_start_with_unreachable_zookeeper() {
         thread::spawn(move || {
             let mut resolver = ManateePrimaryResolver::new(connect_string_resolver,
                 root_path_resolver, Some(log));
-            resolver.run(tx_clone);
+            resolver.run(tx);
         });
 
         // Wait for resolver to start up
@@ -77,13 +76,11 @@ fn connection_test_reconnect_after_zk_hiccup() {
         let connect_string_resolver = ctx.connect_string.clone();
         let root_path_resolver = ctx.root_path.clone();
 
-        let tx_clone = tx.clone();
-
         let log = util::log_from_env(util::DEFAULT_LOG_LEVEL).unwrap();
         thread::spawn(move || {
             let mut resolver = ManateePrimaryResolver::new(connect_string_resolver,
                 root_path_resolver, Some(log));
-            resolver.run(tx_clone);
+            resolver.run(tx);
         });
 
         // Wait for resolver to start up
