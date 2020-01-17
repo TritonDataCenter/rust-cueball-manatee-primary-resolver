@@ -31,6 +31,7 @@ use common::util;
 
 const DEFAULT_CONN_STR: &str = "127.0.0.1:2181";
 const DEFAULT_PATH: &str = "/manatee/1.boray.virtual.example.com";
+
 fn main() {
     let matches = App::new("Manatee Primary Resolver CLI")
         .version("0.1.0")
@@ -63,10 +64,9 @@ fn main() {
         .get_matches();
 
     let s = matches.value_of("connect string").unwrap_or(DEFAULT_CONN_STR)
-        .parse::<ZkConnectString>().unwrap();
+        .parse::<ZkConnectString>().expect("Invalid ZK connect string");
     let p = matches.value_of("root path")
-        .unwrap_or(DEFAULT_PATH).parse::<String>()
-        .unwrap();
+        .unwrap_or(DEFAULT_PATH).to_string();
 
     //
     // Try to get the log level from the CLI arg and, if that fails, the
@@ -74,10 +74,11 @@ fn main() {
     //
     let l = match matches.value_of("log level") {
         Some(level_str) => {
-            util::parse_log_level(level_str.to_string()).unwrap()
+            util::parse_log_level(level_str.to_string())
+                .expect("Invalid log level")
         },
         None => {
-            util::log_level_from_env().unwrap()
+            util::log_level_from_env().expect("Invalid log level")
                 .unwrap_or(util::DEFAULT_LOG_LEVEL)
         }
     };

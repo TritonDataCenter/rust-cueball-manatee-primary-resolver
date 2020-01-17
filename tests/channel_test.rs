@@ -1,9 +1,14 @@
+//
+// Copyright 2019 Joyent, Inc
+//
+
 use std::str::FromStr;
 use std::sync::{Arc, Condvar, Mutex};
+use std::sync::mpsc::channel;
 use std::thread;
-use std::time::Duration;
 
 use cueball::resolver::Resolver;
+use uuid::Uuid;
 
 use cueball_manatee_primary_resolver::{
     ManateePrimaryResolver,
@@ -11,11 +16,13 @@ use cueball_manatee_primary_resolver::{
     HEARTBEAT_INTERVAL,
     common
 };
-use common::util;
-
-use std::sync::mpsc::channel;
-
-use uuid::Uuid;
+use common::util::{
+    self,
+    DEFAULT_LOG_LEVEL,
+    RESOLVER_STARTUP_DELAY,
+    SLACK_DURATION,
+    STANDARD_RECV_TIMEOUT
+};
 
 //
 // Tests that the resolver exits immediately if the receiver is closed when the
@@ -23,15 +30,12 @@ use uuid::Uuid;
 //
 #[test]
 fn channel_test_start_with_closed_rx() {
-
     let (tx, rx) = channel();
 
     let connect_string = ZkConnectString::from_str(
          "10.77.77.6:2181").unwrap();
     let root_path = "/test-".to_string() + &Uuid::new_v4().to_string();
-
-    let root_path_resolver = root_path.clone();
-    let tx_clone = tx.clone();
+    let log = util::log_from_env(DEFAULT_LOG_LEVEL).unwrap();
 
     let pair = Arc::new((Mutex::new(false), Condvar::new()));
     let pair2 = pair.clone();
@@ -39,27 +43,28 @@ fn channel_test_start_with_closed_rx() {
     // Close the receiver before the resolver even starts
     drop(rx);
 
-    let log = util::log_from_env(util::DEFAULT_LOG_LEVEL).unwrap();
+    // Run the resolver and signal the condvar when it exits
     thread::spawn(move || {
         let (lock, cvar) = &*pair2;
         let mut resolver = ManateePrimaryResolver::new(connect_string,
-            root_path_resolver, Some(log));
-        resolver.run(tx_clone);
+            root_path, Some(log));
+        resolver.run(tx);
         let mut resolver_exited = lock.lock().unwrap();
         *resolver_exited = true;
         cvar.notify_all();
     });
 
-
     let (lock, cvar) = &*pair;
-    let mut resolver_exited = lock.lock().unwrap();
 
+    // Wait for the resolver to exit, allowing a brief timeout
+    let mut resolver_exited = lock.lock().unwrap();
     while !*resolver_exited {
         let result =
-            cvar.wait_timeout(resolver_exited, Duration::from_secs(1)).unwrap();
+            cvar.wait_timeout(resolver_exited, STANDARD_RECV_TIMEOUT).unwrap();
         resolver_exited = result.0;
         if result.1.timed_out() {
-            panic!("Resolver did not immediately exit upon starting with closed receiver");
+            panic!("Resolver did not immediately exit upon starting with \
+                closed receiver");
         }
     }
 }
@@ -70,45 +75,37 @@ fn channel_test_start_with_closed_rx() {
 //
 #[test]
 fn channel_test_exit_upon_closed_rx() {
-
     let (tx, rx) = channel();
 
     let connect_string = ZkConnectString::from_str(
          "127.0.0.1:2181").unwrap();
     let root_path = "/test-".to_string() + &Uuid::new_v4().to_string();
-
-    let root_path_resolver = root_path.clone();
-    let tx_clone = tx.clone();
+    let log = util::log_from_env(DEFAULT_LOG_LEVEL).unwrap();
 
     let pair = Arc::new((Mutex::new(false), Condvar::new()));
     let pair2 = pair.clone();
 
-    let log = util::log_from_env(util::DEFAULT_LOG_LEVEL).unwrap();
+    // Start the resolver
     thread::spawn(move || {
         let (lock, cvar) = &*pair2;
         let mut resolver = ManateePrimaryResolver::new(connect_string,
-            root_path_resolver, Some(log));
-        resolver.run(tx_clone);
+            root_path, Some(log));
+        resolver.run(tx);
         let mut resolver_exited = lock.lock().unwrap();
         *resolver_exited = true;
         cvar.notify_all();
     });
 
-    //
-    // We want this thread to not progress until the resolver thread above has
-    // time to set the watch and block. REALLY, this should be done with thread
-    // priorities, but the thread-priority crate depends on some pthread
-    // functions that _aren't in the libc crate for illumos_. We should add
-    // these functions and upstream a change, but, for now, here's this.
-    //
-    thread::sleep(Duration::from_secs(2));
+    // See comment in TestContext::run_test_case about why we sleep here.
+    thread::sleep(RESOLVER_STARTUP_DELAY);
 
     // Close the receiver once the resolver has started
     drop(rx);
 
     let (lock, cvar) = &*pair;
-    let mut resolver_exited = lock.lock().unwrap();
 
+    // Wait for the resolver to exit
+    let mut resolver_exited = lock.lock().unwrap();
     while !*resolver_exited {
         //
         // We should wait a little longer than HEARTBEAT_INTERVAL for the
@@ -116,7 +113,7 @@ fn channel_test_exit_upon_closed_rx() {
         //
         let result = cvar.wait_timeout(
             resolver_exited,
-            Duration::from_millis(10) + HEARTBEAT_INTERVAL
+            SLACK_DURATION + HEARTBEAT_INTERVAL
         ).unwrap();
         resolver_exited = result.0;
         if result.1.timed_out() {

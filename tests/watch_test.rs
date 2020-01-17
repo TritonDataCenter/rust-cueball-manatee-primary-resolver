@@ -1,6 +1,9 @@
+//
+// Copyright 2019 Joyent, Inc
+//
+
 use std::sync::mpsc::channel;
 use std::thread;
-use std::time::Duration;
 
 use cueball::resolver::Resolver;
 
@@ -9,7 +12,11 @@ use cueball_manatee_primary_resolver::{
     WATCH_LOOP_DELAY
 };
 use cueball_manatee_primary_resolver::common::{util, test_data};
-use util::{TestContext, TestAction};
+use util::{
+    TestContext,
+    TestAction,
+    RESOLVER_STARTUP_DELAY
+};
 
 #[test]
 fn watch_test_nonexistent_node() {
@@ -20,17 +27,17 @@ fn watch_test_nonexistent_node() {
 
         let connect_string_resolver = ctx.connect_string.clone();
         let root_path_resolver = ctx.root_path.clone();
+        let log = util::log_from_env(util::DEFAULT_LOG_LEVEL).unwrap();
 
         // Start the resolver
-        let log = util::log_from_env(util::DEFAULT_LOG_LEVEL).unwrap();
         thread::spawn(move || {
             let mut resolver = ManateePrimaryResolver::new(
                 connect_string_resolver, root_path_resolver, Some(log));
             resolver.run(tx);
         });
 
-        // Wait for resolver to start up and discover that the node is missing
-        thread::sleep(Duration::from_secs(1));
+        // See comment in TestContext::run_test_case about why we sleep here.
+        thread::sleep(RESOLVER_STARTUP_DELAY);
 
         // Re-create the nodes
         ctx.setup_zk_nodes()?;
@@ -57,17 +64,17 @@ fn watch_test_disappearing_node() {
 
         let connect_string_resolver = ctx.connect_string.clone();
         let root_path_resolver = ctx.root_path.clone();
+        let log = util::log_from_env(util::DEFAULT_LOG_LEVEL).unwrap();
 
         // Start the resolver
-        let log = util::log_from_env(util::DEFAULT_LOG_LEVEL).unwrap();
         thread::spawn(move || {
             let mut resolver = ManateePrimaryResolver::new(
                 connect_string_resolver, root_path_resolver, Some(log));
             resolver.run(tx);
         });
 
-        // Wait for resolver to start up
-        thread::sleep(Duration::from_secs(1));
+        // See comment in TestContext::run_test_case about why we sleep here.
+        thread::sleep(RESOLVER_STARTUP_DELAY);
 
         // Run a basic test case to make sure all is well
         let data_1 = test_data::backend_ip1_port1();
@@ -87,7 +94,7 @@ fn watch_test_disappearing_node() {
 
         // Wait for resolver to notice that the nodes were recreated
         thread::sleep(WATCH_LOOP_DELAY);
-        println!("heeehaw");
+
         // Run the test case again
         ctx.run_test_case(TestAction {
             start_data: data_1.raw_vec(),

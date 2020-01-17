@@ -24,6 +24,7 @@ use std::convert::From;
 use std::fmt::Debug;
 use std::net::{AddrParseError, SocketAddr};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -50,15 +51,25 @@ use slog::{
 };
 use slog::Result as SlogResult;
 use slog::Value as SlogValue;
-// TODO ditch the asterisk imports (here and everywhere)
-use tokio_zookeeper::*;
+use tokio_zookeeper::{
+    KeeperState,
+    WatchedEvent,
+    WatchedEventType,
+    ZooKeeper,
+    ZooKeeperBuilder
+};
 use tokio::prelude::*;
 use tokio::runtime::Runtime;
 use tokio::timer::Delay;
 use tokio::timer::timeout::Error as TimeoutError;
 use url::Url;
 
-use cueball::backend::*;
+use cueball::backend::{
+    self,
+    BackendAddress,
+    BackendKey,
+    Backend,
+};
 use cueball::resolver::{
     BackendAddedMsg,
     BackendRemovedMsg,
@@ -417,7 +428,7 @@ fn process_value(
 
     // Construct a backend and key
     let backend = Backend::new(&ip, port);
-    let backend_key = srv_key(&backend);
+    let backend_key = backend::srv_key(&backend);
 
     // Determine whether we need to send the new backend over
     let mut last_backend = last_backend.lock().unwrap();
@@ -734,7 +745,7 @@ fn connect_loop(
                     loop_state,
                     log
                 )
-                .map_err(|err| TimeoutError::inner(err))
+                .map_err(TimeoutError::inner)
             })
             .and_then(|next_action| {
                 ok(match next_action {
@@ -813,7 +824,7 @@ impl Resolver for ManateePrimaryResolver {
         let log = self.log.clone();
         let at_log = self.log.clone();
 
-        let exited = Arc::new(Mutex::new(false));
+        let exited = Arc::new(AtomicBool::new(false));
         let exited_clone = Arc::clone(&exited);
 
         //
@@ -852,7 +863,7 @@ impl Resolver for ManateePrimaryResolver {
                 )
             }).and_then(move |_| {
                 info!(at_log, "Event-processing task stopping");
-                *exited_clone.lock().unwrap() = true;
+                exited_clone.store(true, Ordering::Relaxed);
                 Ok(())
             })
             .map(|_| ())
@@ -866,7 +877,7 @@ impl Resolver for ManateePrimaryResolver {
         // exits.
         //
         loop {
-            if *exited.lock().unwrap() {
+            if exited.load(Ordering::Relaxed) {
                 info!(self.log,
                     "event-processing task exited; stopping heartbeats");
                 break;
@@ -877,13 +888,14 @@ impl Resolver for ManateePrimaryResolver {
             }
             thread::sleep(HEARTBEAT_INTERVAL);
         }
-        info!(self.log, "Stopping runtime");
+
         //
         // We shut down the background watch-looping thread. It may have already
         // exited by itself if it noticed that the connection pool closed its
         // channel, but there's no harm still calling shutdown_now() in that
         // case.
         //
+        info!(self.log, "Stopping runtime");
         rt.shutdown_now().wait().unwrap();
         info!(self.log, "Runtime stopped successfully");
         self.is_running = false;

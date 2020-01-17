@@ -4,12 +4,21 @@
 
 use std::str::FromStr;
 
-use cueball::backend::*;
+use cueball::backend::{
+    self,
+    Backend,
+    BackendAddress,
+    BackendKey
+};
 use cueball::resolver::{
     BackendAddedMsg,
     BackendRemovedMsg,
 };
 
+//
+// Return a vector of some mock manatee ZooKeeper data, given the passed-in ip
+// and port
+//
 pub fn json_vec(ip: &str, port: u16) -> Vec<u8> {
     //
     // Most of the data here isn't relevant, but real json from zookeeper
@@ -58,16 +67,22 @@ impl BackendData {
     pub fn new(ip: &str, port: u16) -> Self {
         BackendData {
             vec: json_vec(ip, port),
-            object: Backend::new(&BackendAddress::from_str(ip).unwrap(), port)
+            object: Backend::new(&BackendAddress::from_str(ip)
+                .expect("Invalid IP address"), port)
         }
     }
+
+    //
+    // The below functions provide convenient ways to convert the data to
+    // various related types.
+    //
 
     pub fn raw_vec(&self) -> Vec<u8> {
         self.vec.clone()
     }
 
     pub fn key(&self) -> BackendKey {
-        srv_key(&self.object)
+        backend::srv_key(&self.object)
     }
 
     pub fn added_msg(&self) -> BackendAddedMsg {
@@ -81,6 +96,10 @@ impl BackendData {
         BackendRemovedMsg(self.key())
     }
 }
+
+//
+// The rest of the functions here provide mock data for use in tests.
+//
 
 pub fn backend_ip1_port1() -> BackendData {
     BackendData::new("10.77.77.28", 5432)
@@ -99,7 +118,7 @@ pub fn backend_ip2_port2() -> BackendData {
 }
 
 pub fn invalid_json_vec() -> Vec<u8> {
-    "foo".as_bytes().to_vec()
+    b"foo".to_vec()
 }
 
 pub fn no_ip_vec() -> Vec<u8> {
